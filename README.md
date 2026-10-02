@@ -4,7 +4,7 @@
 
 两端像 WireGuard 一样预先配置对端公钥。客户端通过多个边缘接入点连接核心服务器；同一个 IP 包在多条独立 QUIC 连接上发送，接收端只交付最先收到的有效副本。
 
-> 当前处于工程初始化阶段：可构建命令行入口，尚未实现隧道连接、密钥管理、TUN 收发或多路径转发。以下能力是设计目标。
+> 当前处于需求与设计阶段。用户要求先完成全部设计，再进入开发：需求边界、协议、异常行为、配置与验收标准经评审确认后，才开始实现。现有代码仅为工程骨架。
 
 ## 设计方向
 
@@ -57,7 +57,9 @@ cargo test --locked --all-targets
 
 - [需求与验收边界](docs/requirements.md)
 - [Rust + Quinn 选型记录](docs/architecture.md)
-- [实施顺序与验证计划](docs/roadmap.md)
+- [设计决策与评审清单](docs/design-review.md)
+- [验收场景草案](docs/acceptance.md)
+- [设计与实施顺序](docs/roadmap.md)
 
 ## 许可
 
