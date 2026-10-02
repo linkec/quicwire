@@ -1,0 +1,13 @@
+[package]
+name = "quicwire"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+publish = false
+description = "使用公私钥身份的多路径 QUIC 冗余 IP 隧道"
+repository = "https://github.com/linkec/quicwire"
+readme = "README.md"
+
+[dependencies]
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
