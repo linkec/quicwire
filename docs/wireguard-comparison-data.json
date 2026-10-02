@@ -1,0 +1,598 @@
+{
+  "date": "2026-10-02",
+  "source_commit": "d65e7f5",
+  "kernel": "6.8.0-134-generic",
+  "iperf": "3.16",
+  "wireguard_tools": "1.0.20210914",
+  "vcpu_per_guest": 2,
+  "pings": {
+    "outer": {
+      "min_ms": 0.262,
+      "average_ms": 0.353,
+      "max_ms": 0.491,
+      "mdev_ms": 0.033
+    },
+    "quicwire": {
+      "min_ms": 1.049,
+      "average_ms": 1.294,
+      "max_ms": 1.998,
+      "mdev_ms": 0.111
+    },
+    "wg1100": {
+      "min_ms": 0.469,
+      "average_ms": 0.763,
+      "max_ms": 1.108,
+      "mdev_ms": 0.156
+    }
+  },
+  "idle_cpu": {
+    "server": {
+      "busy_percent_of_vm": 3.911,
+      "steal_percent": 0.0
+    },
+    "client": {
+      "busy_percent_of_vm": 4.159,
+      "steal_percent": 0.0
+    }
+  },
+  "runs": [
+    {
+      "name": "outer_tcp",
+      "receive_mbps": 13413.853167657175,
+      "retransmits": 0,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 44.178,
+          "steal_percent": 0.084
+        },
+        "client": {
+          "busy_percent_of_vm": 34.598,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.284771791999997
+    },
+    {
+      "name": "quicwire_tcp_forward_1",
+      "receive_mbps": 189.22066283429143,
+      "retransmits": 461,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 54.198,
+          "steal_percent": 0.042
+        },
+        "client": {
+          "busy_percent_of_vm": 48.765,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.303784458000003
+    },
+    {
+      "name": "quicwire_tcp_reverse_1",
+      "receive_mbps": 207.09653509357022,
+      "retransmits": 618,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 51.099,
+          "steal_percent": 0.039
+        },
+        "client": {
+          "busy_percent_of_vm": 53.862,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.291833874999995
+    },
+    {
+      "name": "wg1100_tcp_forward_1",
+      "receive_mbps": 1339.322282778696,
+      "retransmits": 45,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 80.294,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 59.466,
+          "steal_percent": 0.043
+        }
+      },
+      "measurement_wall_seconds": 12.295345249999997
+    },
+    {
+      "name": "wg1100_tcp_reverse_1",
+      "receive_mbps": 1577.4767879139272,
+      "retransmits": 52,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 66.723,
+          "steal_percent": 0.042
+        },
+        "client": {
+          "busy_percent_of_vm": 79.018,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.29623108300001
+    },
+    {
+      "name": "wg1100_tcp_forward_2",
+      "receive_mbps": 1452.0051419206072,
+      "retransmits": 67,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 82.943,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 64.441,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.284495875000005
+    },
+    {
+      "name": "wg1100_tcp_reverse_2",
+      "receive_mbps": 1355.082488770186,
+      "retransmits": 1,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 62.576,
+          "steal_percent": 0.041
+        },
+        "client": {
+          "busy_percent_of_vm": 74.007,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.29518904199999
+    },
+    {
+      "name": "quicwire_tcp_forward_2",
+      "receive_mbps": 190.13361753663946,
+      "retransmits": 450,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 54.051,
+          "steal_percent": 0.039
+        },
+        "client": {
+          "busy_percent_of_vm": 47.42,
+          "steal_percent": 0.043
+        }
+      },
+      "measurement_wall_seconds": 12.287531125000001
+    },
+    {
+      "name": "quicwire_tcp_reverse_2",
+      "receive_mbps": 199.87523520709277,
+      "retransmits": 500,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 50.165,
+          "steal_percent": 0.041
+        },
+        "client": {
+          "busy_percent_of_vm": 54.436,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.308455583000011
+    },
+    {
+      "name": "quicwire_tcp_forward_3",
+      "receive_mbps": 185.75402143860853,
+      "retransmits": 364,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 53.292,
+          "steal_percent": 0.042
+        },
+        "client": {
+          "busy_percent_of_vm": 46.939,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.278487999999982
+    },
+    {
+      "name": "quicwire_tcp_reverse_3",
+      "receive_mbps": 194.51059513622633,
+      "retransmits": 493,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 52.729,
+          "steal_percent": 0.042
+        },
+        "client": {
+          "busy_percent_of_vm": 54.811,
+          "steal_percent": 0.044
+        }
+      },
+      "measurement_wall_seconds": 12.280718917000002
+    },
+    {
+      "name": "wg1100_tcp_forward_3",
+      "receive_mbps": 1530.8385766720648,
+      "retransmits": 14,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 80.341,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 58.123,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.286069874999981
+    },
+    {
+      "name": "wg1100_tcp_reverse_3",
+      "receive_mbps": 1343.8889018659816,
+      "retransmits": 0,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 65.312,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 76.245,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.300245415999996
+    },
+    {
+      "name": "quicwire_udp_10m_forward",
+      "receive_mbps": 9.99627601478597,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.16481153887515407,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 2.906,
+          "steal_percent": 0.071
+        },
+        "client": {
+          "busy_percent_of_vm": 56.348,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.281507290999997
+    },
+    {
+      "name": "quicwire_udp_10m_reverse",
+      "receive_mbps": 10.000503674637683,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.07891810041233772,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 60.166,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 3.393,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.282252457999988
+    },
+    {
+      "name": "wg1100_udp_10m_forward",
+      "receive_mbps": 9.995215561508024,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.04884751399502898,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 26.306,
+          "steal_percent": 0.049
+        },
+        "client": {
+          "busy_percent_of_vm": 66.271,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.284747041000003
+    },
+    {
+      "name": "wg1100_udp_10m_reverse",
+      "receive_mbps": 10.000607415417402,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.02383092071525151,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 50.616,
+          "steal_percent": 0.062
+        },
+        "client": {
+          "busy_percent_of_vm": 3.228,
+          "steal_percent": 0.063
+        }
+      },
+      "measurement_wall_seconds": 8.291418499999992
+    },
+    {
+      "name": "quicwire_udp_100m_forward",
+      "receive_mbps": 99.95696422332419,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.01712251919223974,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 47.728,
+          "steal_percent": 0.051
+        },
+        "client": {
+          "busy_percent_of_vm": 70.151,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.285361541999976
+    },
+    {
+      "name": "quicwire_udp_100m_reverse",
+      "receive_mbps": 100.00258720473525,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.0586479918668941,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 74.017,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 38.644,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.231794999999977
+    },
+    {
+      "name": "wg1100_udp_100m_forward",
+      "receive_mbps": 99.9512568814825,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.013053646545691449,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 5.539,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 53.915,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.283526750000021
+    },
+    {
+      "name": "wg1100_udp_100m_reverse",
+      "receive_mbps": 100.00247466530152,
+      "retransmits": null,
+      "lost_percent": 0,
+      "jitter_ms": 0.006335763261933427,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 52.269,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 9.673,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.22776058300002
+    },
+    {
+      "name": "quicwire_udp_300m_forward",
+      "receive_mbps": 291.25001843161573,
+      "retransmits": null,
+      "lost_percent": 2.8762780402105537,
+      "jitter_ms": 0.015930984737350967,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 64.865,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 72.414,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.263224541999989
+    },
+    {
+      "name": "quicwire_udp_300m_reverse",
+      "receive_mbps": 278.75120484096095,
+      "retransmits": null,
+      "lost_percent": 7.050908230558267,
+      "jitter_ms": 0.060628007941654356,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 74.766,
+          "steal_percent": 0.072
+        },
+        "client": {
+          "busy_percent_of_vm": 46.881,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.252111375000027
+    },
+    {
+      "name": "wg1100_udp_300m_forward",
+      "receive_mbps": 299.7872631330834,
+      "retransmits": null,
+      "lost_percent": 0.04567001580115875,
+      "jitter_ms": 0.003167413533808304,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 25.257,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 60.635,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.285228666000023
+    },
+    {
+      "name": "wg1100_udp_300m_reverse",
+      "receive_mbps": 299.7377883072434,
+      "retransmits": null,
+      "lost_percent": 0.07899078440848567,
+      "jitter_ms": 0.005153566221154685,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 60.471,
+          "steal_percent": 0.067
+        },
+        "client": {
+          "busy_percent_of_vm": 56.758,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 8.238717791999989
+    },
+    {
+      "name": "wg1420_tcp_forward_1",
+      "receive_mbps": 2014.1852194149587,
+      "retransmits": 31,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 88.502,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 62.016,
+          "steal_percent": 0.043
+        }
+      },
+      "measurement_wall_seconds": 12.295069875000024
+    },
+    {
+      "name": "wg1420_tcp_reverse_1",
+      "receive_mbps": 2038.527428226573,
+      "retransmits": 84,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 69.192,
+          "steal_percent": 0.042
+        },
+        "client": {
+          "busy_percent_of_vm": 87.757,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.292443875000004
+    },
+    {
+      "name": "wg1420_tcp_forward_2",
+      "receive_mbps": 2000.0633512086501,
+      "retransmits": 0,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 88.943,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 60.223,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.296025415999964
+    },
+    {
+      "name": "wg1420_tcp_reverse_2",
+      "receive_mbps": 1742.4340726198388,
+      "retransmits": 0,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 62.05,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 83.475,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.292521959000055
+    },
+    {
+      "name": "wg1420_tcp_forward_3",
+      "receive_mbps": 1842.4455376134838,
+      "retransmits": 469,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 85.196,
+          "steal_percent": 0.0
+        },
+        "client": {
+          "busy_percent_of_vm": 61.901,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.319951666999998
+    },
+    {
+      "name": "wg1420_tcp_reverse_3",
+      "receive_mbps": 1807.3630060142245,
+      "retransmits": 301,
+      "lost_percent": null,
+      "jitter_ms": null,
+      "cpu": {
+        "server": {
+          "busy_percent_of_vm": 64.21,
+          "steal_percent": 0.041
+        },
+        "client": {
+          "busy_percent_of_vm": 84.262,
+          "steal_percent": 0.0
+        }
+      },
+      "measurement_wall_seconds": 12.304846416999965
+    }
+  ]
+}
