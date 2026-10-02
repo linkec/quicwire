@@ -1,6 +1,8 @@
 mode = "client"
 bind = "0.0.0.0:0"
 endpoint = "192.0.2.1:4433" # 替换为服务器实际地址
+# 可选：你控制的服务域名，仅用于 SNI 和 HTTP authority；不进行 DNS 解析
+# server_name = "vpn.example.com"
 private_key_file = "client.key"
 peer_public_key = "替换为服务端 keygen 输出的完整公钥"
 tun_name = "qw0"

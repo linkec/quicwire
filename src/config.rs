@@ -20,6 +20,8 @@ pub struct Config {
     pub mode: Mode,
     pub bind: SocketAddr,
     pub endpoint: Option<SocketAddr>,
+    /// 可选 DNS 名称，用于 SNI 与 HTTP authority；身份仍按 peer 公钥固定。
+    pub server_name: Option<String>,
     pub private_key_file: PathBuf,
     pub peer_public_key: String,
     pub tun_name: String,
@@ -41,6 +43,21 @@ fn default_mtu() -> u16 {
 }
 
 impl Config {
+    pub fn tls_server_name(&self) -> Result<String> {
+        Ok(self
+            .server_name
+            .clone()
+            .unwrap_or(self.endpoint.context("缺少 endpoint")?.ip().to_string()))
+    }
+
+    pub fn http_authority(&self) -> Result<String> {
+        let endpoint = self.endpoint.context("缺少 endpoint")?;
+        Ok(match &self.server_name {
+            Some(name) => format!("{name}:{}", endpoint.port()),
+            None => endpoint.to_string(),
+        })
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         ensure!(
             std::fs::metadata(path)?.len() <= 65536,
@@ -60,6 +77,16 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         PublicKey::parse(&self.peer_public_key)?;
+        if let Some(name) = &self.server_name {
+            ensure!(self.mode == Mode::Client, "server_name 仅用于 client 模式");
+            ensure!(
+                matches!(
+                    rustls::pki_types::ServerName::try_from(name.as_str()),
+                    Ok(rustls::pki_types::ServerName::DnsName(_))
+                ),
+                "server_name 必须是有效 DNS 名称"
+            );
+        }
         ensure!(
             !self.tun_name.is_empty()
                 && self.tun_name.len() <= 15

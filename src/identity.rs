@@ -6,10 +6,7 @@ use ring::{
     rand::SystemRandom,
     signature::{Ed25519KeyPair, KeyPair},
 };
-use rustls::{
-    pki_types::{CertificateDer, PrivatePkcs8KeyDer},
-    sign::CertifiedKey,
-};
+use rustls::{pki_types::PrivatePkcs8KeyDer, sign::CertifiedKey};
 
 const PRIVATE_PREFIX: &str = "quicwire-private-v1:";
 const PUBLIC_PREFIX: &str = "quicwire-public-v1:";
@@ -72,10 +69,18 @@ impl Identity {
         let signing = rustls::crypto::ring::sign::any_supported_type(
             &PrivatePkcs8KeyDer::from(der.to_vec()).into(),
         )?;
-        let certified_key = Arc::new(CertifiedKey::new(
-            vec![CertificateDer::from(public.spki())],
-            signing,
-        ));
+        // X.509 只是现有身份公钥的 TLS 容器；信任仍来自预配置 SPKI。
+        let certificate_key = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+            &PrivatePkcs8KeyDer::from(der.to_vec()),
+            &rcgen::PKCS_ED25519,
+        )?;
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "peer");
+        let certificate = params.self_signed(&certificate_key)?;
+        let certified_key = Arc::new(CertifiedKey::new(vec![certificate.der().clone()], signing));
         Ok(Self {
             public,
             certified_key,

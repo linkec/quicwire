@@ -12,6 +12,7 @@ fn config(mode: Mode, peer: &PublicKey) -> Config {
         mode,
         bind: "127.0.0.1:4433".parse().unwrap(),
         endpoint: (mode == Mode::Client).then(|| "127.0.0.1:4433".parse().unwrap()),
+        server_name: None,
         private_key_file: "unused.key".into(),
         peer_public_key: peer.encode(),
         tun_name: "qw0".into(),
@@ -55,7 +56,7 @@ async fn endpoints(
 }
 
 #[tokio::test]
-async fn mutual_raw_public_keys_and_bidirectional_datagrams() {
+async fn mutual_pinned_public_keys_h3_and_bidirectional_datagrams() {
     let (server_id, _) = Identity::generate().unwrap();
     let (client_id, _) = Identity::generate().unwrap();
     let (_server, _client, server_conn, client_conn) =
@@ -68,25 +69,42 @@ async fn mutual_raw_public_keys_and_bidirectional_datagrams() {
         transport::negotiate(&server_conn, &server_cfg),
         transport::negotiate(&client_conn, &client_cfg)
     );
-    s.unwrap();
-    c.unwrap();
+    let mut server_session = s.unwrap();
+    let mut client_session = c.unwrap();
+    let handshake = client_conn
+        .handshake_data()
+        .unwrap()
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .unwrap();
+    assert_eq!(handshake.protocol.as_deref(), Some(b"h3".as_slice()));
     let data = vec![0x5a; 1100];
-    client_conn.send_datagram(data.clone().into()).unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(2), server_conn.read_datagram())
+    client_conn
+        .send_datagram(client_session.active.encode(&data))
+        .unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), server_session.read_datagram())
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(got.as_ref(), data);
+    assert_eq!(server_session.active.decode(&got).unwrap(), data);
+    assert!(server_session.active.decode(&[1, 0, 0x45]).is_none());
+    assert!(server_session.active.decode(&[0, 1, 0x45]).is_none());
+    assert!(server_session.active.decode(&[0]).is_none());
     server_conn
-        .send_datagram(b"return-path".to_vec().into())
+        .send_datagram(server_session.active.encode(b"return-path"))
+        .unwrap();
+    let received = tokio::time::timeout(Duration::from_secs(2), client_session.read_datagram())
+        .await
+        .unwrap()
         .unwrap();
     assert_eq!(
-        tokio::time::timeout(Duration::from_secs(2), client_conn.read_datagram())
-            .await
-            .unwrap()
-            .unwrap()
-            .as_ref(),
+        client_session.active.decode(&received).unwrap(),
         b"return-path"
+    );
+    drop(server_session);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), client_conn.closed())
+            .await
+            .is_ok()
     );
 }
 
@@ -118,9 +136,7 @@ async fn copying_public_key_without_private_key_is_rejected() {
     let forged = Identity {
         public: victim.public.clone(),
         certified_key: Arc::new(rustls::sign::CertifiedKey::new(
-            vec![rustls::pki_types::CertificateDer::from(
-                victim.public.spki(),
-            )],
+            victim.certified_key.cert.clone(),
             attacker.certified_key.key.clone(),
         )),
     };
@@ -152,7 +168,7 @@ async fn mismatched_tunnel_config_is_rejected_after_tls() {
 }
 
 #[tokio::test]
-async fn oversized_control_message_is_rejected() {
+async fn non_http3_control_stream_is_rejected() {
     let (server_id, _) = Identity::generate().unwrap();
     let (client_id, _) = Identity::generate().unwrap();
     let (_s, _c, server_conn, client_conn) =
@@ -246,4 +262,131 @@ async fn data_plane_rejects_invalid_mtu_before_creating_devices() {
     cfg.mtu = 100;
     let error = quicwire::tunnel::run(cfg, identity).await.unwrap_err();
     assert!(error.to_string().contains("MTU"));
+}
+
+#[tokio::test]
+async fn cancelling_h3_negotiation_closes_connection() {
+    let (server_id, _) = Identity::generate().unwrap();
+    let (client_id, _) = Identity::generate().unwrap();
+    let (_s, _c, server_conn, client_conn) =
+        endpoints(&server_id, &client_id, &client_id.public, &server_id.public).await;
+    let server_conn = server_conn.unwrap();
+    let client_conn = client_conn.unwrap();
+    let cfg = config(Mode::Client, &server_id.public);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(30),
+            transport::negotiate(&client_conn, &cfg)
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), server_conn.closed())
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn http3_capsule_fallback_and_request_lifetime() {
+    use bytes::Bytes;
+    let (server_id, _) = Identity::generate().unwrap();
+    let (client_id, _) = Identity::generate().unwrap();
+    let (_s, _c, server_conn, client_conn) =
+        endpoints(&server_id, &client_id, &client_id.public, &server_id.public).await;
+    let server_conn = server_conn.unwrap();
+    let client_conn = client_conn.unwrap();
+    let cfg = config(Mode::Server, &client_id.public);
+    let negotiation = tokio::spawn(async move { transport::negotiate(&server_conn, &cfg).await });
+    let (mut driver, mut sender) = h3::client::builder()
+        .enable_datagram(true)
+        .build::<_, _, Bytes>(h3_quinn::Connection::new(client_conn.clone()))
+        .await
+        .unwrap();
+    use h3::ConnectionState;
+    std::future::poll_fn(|cx| {
+        assert!(driver.poll_close(cx).is_pending());
+        match sender.peer_datagram_settings() {
+            Some((true, true)) => std::task::Poll::Ready(()),
+            _ => std::task::Poll::Pending,
+        }
+    })
+    .await;
+    let drive = tokio::spawn(async move { driver.wait_idle().await });
+    let request = http::Request::builder()
+        .method("CONNECT")
+        .uri("https://127.0.0.1/.well-known/masque/ip/*/*/")
+        .extension(h3::ext::Protocol::CONNECT_IP)
+        .header("capsule-protocol", "?1")
+        .header("x-tunnel-address", "10.77.0.2")
+        .header("x-tunnel-peer", "10.77.0.1")
+        .header("x-tunnel-mtu", "1100")
+        .body(())
+        .unwrap();
+    let mut stream = sender.send_request(request).await.unwrap();
+    let response = stream.recv_response().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let mut session = negotiation.await.unwrap().unwrap();
+    // 未知 Capsule、未知 Context 忽略；合法 Capsule 可以跨多个 DATA 帧。
+    stream
+        .send_data(Bytes::from_static(&[23, 0, 0, 2, 1, 7, 0, 4, 0, b'a']))
+        .await
+        .unwrap();
+    stream.send_data(Bytes::from_static(b"bc")).await.unwrap();
+    let datagram = tokio::time::timeout(Duration::from_secs(2), session.read_datagram())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.active.decode(&datagram), Some(b"abc".as_slice()));
+    stream.finish().await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), client_conn.closed())
+            .await
+            .is_ok()
+    );
+    drive.abort();
+}
+
+#[tokio::test]
+async fn h3_peer_without_connect_settings_is_rejected() {
+    let (server_id, _) = Identity::generate().unwrap();
+    let (client_id, _) = Identity::generate().unwrap();
+    let (_s, _c, server_conn, client_conn) =
+        endpoints(&server_id, &client_id, &client_id.public, &server_id.public).await;
+    let server_conn = server_conn.unwrap();
+    let client_conn = client_conn.unwrap();
+    let mut server = h3::server::builder()
+        .build::<_, bytes::Bytes>(h3_quinn::Connection::new(server_conn))
+        .await
+        .unwrap();
+    let drive = tokio::spawn(async move { server.accept().await });
+    let cfg = config(Mode::Client, &server_id.public);
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            transport::negotiate(&client_conn, &cfg)
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    drive.abort();
+}
+
+#[test]
+fn identity_certificate_keeps_pinned_public_key_and_optional_sni() {
+    let (id, _) = Identity::generate().unwrap();
+    let (rest, cert) =
+        x509_parser::parse_x509_certificate(id.certified_key.cert[0].as_ref()).unwrap();
+    assert!(rest.is_empty());
+    assert_eq!(cert.public_key().raw, id.public.spki());
+    let mut cfg = config(Mode::Client, &id.public);
+    assert_eq!(cfg.tls_server_name().unwrap(), "127.0.0.1");
+    cfg.server_name = Some("vpn.example.com".into());
+    cfg.validate().unwrap();
+    assert_eq!(cfg.tls_server_name().unwrap(), "vpn.example.com");
+    assert_eq!(cfg.http_authority().unwrap(), "vpn.example.com:4433");
+    cfg.server_name = Some("https://bad.example/path".into());
+    assert!(cfg.validate().is_err());
 }

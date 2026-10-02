@@ -7,3 +7,5 @@ pub mod transport;
 
 #[cfg(target_os = "linux")]
 pub mod tunnel;
+
+pub mod http3;

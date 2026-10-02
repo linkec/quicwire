@@ -1,30 +1,21 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result, ensure};
-use quinn::{ClientConfig, Connection, ServerConfig, TransportConfig};
+use anyhow::Result;
+use quinn::{ClientConfig, ServerConfig, TransportConfig};
 use rustls::{
     DigitallySignedStruct, DistinguishedName, Error, SignatureScheme,
-    client::{
-        AlwaysResolvesClientRawPublicKeys,
-        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    },
-    pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime},
-    server::{
-        AlwaysResolvesServerRawPublicKeys,
-        danger::{ClientCertVerified, ClientCertVerifier},
-    },
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, ServerName, UnixTime},
+    server::danger::{ClientCertVerified, ClientCertVerifier},
 };
 
-use crate::{
-    config::{Config, Mode},
-    identity::{Identity, PublicKey},
-};
+use crate::identity::{Identity, PublicKey};
 
-pub const ALPN: &[u8] = b"quicwire/0.1";
+pub const ALPN: &[u8] = b"h3";
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// 信任配置中的 Ed25519 SPKI；私钥持有证明仍由 TLS CertificateVerify 验证。
+/// 从 X.509 容器提取 Ed25519 SPKI 精确固定；CertificateVerify 验证私钥持有。
 #[derive(Debug)]
 struct PinnedPeer {
     spki: Vec<u8>,
@@ -36,7 +27,12 @@ impl PinnedPeer {
         presented: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
     ) -> Result<(), Error> {
-        if presented.as_ref() != self.spki || !intermediates.is_empty() {
+        let (rest, certificate) = x509_parser::parse_x509_certificate(presented.as_ref())
+            .map_err(|_| Error::General("对端证书格式无效".into()))?;
+        if !rest.is_empty()
+            || certificate.public_key().raw != self.spki
+            || !intermediates.is_empty()
+        {
             return Err(Error::General("对端公钥不在授权配置中".into()));
         }
         Ok(())
@@ -51,9 +47,9 @@ impl PinnedPeer {
         if signature.scheme != SignatureScheme::ED25519 {
             return Err(Error::General("仅接受 Ed25519 身份签名".into()));
         }
-        rustls::crypto::verify_tls13_signature_with_raw_key(
+        rustls::crypto::verify_tls13_signature(
             message,
-            &SubjectPublicKeyInfoDer::from(key.as_ref()),
+            key,
             signature,
             &rustls::crypto::ring::default_provider().signature_verification_algorithms,
         )
@@ -89,10 +85,9 @@ impl ServerCertVerifier for PinnedPeer {
         self.signature(message, cert, dss)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
-    }
-    fn requires_raw_public_keys(&self) -> bool {
-        true
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -126,19 +121,18 @@ impl ClientCertVerifier for PinnedPeer {
         self.signature(message, cert, dss)
     }
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![SignatureScheme::ED25519]
-    }
-    fn requires_raw_public_keys(&self) -> bool {
-        true
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
 fn transport() -> Arc<TransportConfig> {
     let mut config = TransportConfig::default();
-    config.max_concurrent_bidi_streams(1_u8.into());
-    config.max_concurrent_uni_streams(0_u8.into());
-    config.stream_receive_window(4096_u32.into());
-    config.receive_window(8192_u32.into());
+    config.max_concurrent_bidi_streams(32_u8.into());
+    config.max_concurrent_uni_streams(16_u8.into());
+    config.stream_receive_window((64 * 1024_u32).into());
+    config.receive_window((256 * 1024_u32).into());
     // 接收突发与处理速度解耦；发送端保持小缓冲并采用背压。
     config.datagram_receive_buffer_size(Some(1024 * 1024));
     config.datagram_send_buffer_size(64 * 1024);
@@ -158,7 +152,7 @@ pub fn server_config(identity: &Identity, peer: &PublicKey) -> Result<ServerConf
     ))
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .with_client_cert_verifier(verifier)
-    .with_cert_resolver(Arc::new(AlwaysResolvesServerRawPublicKeys::new(
+    .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
         identity.certified_key.clone(),
     )));
     tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -180,7 +174,7 @@ pub fn client_config(identity: &Identity, peer: &PublicKey) -> Result<ClientConf
     .with_protocol_versions(&[&rustls::version::TLS13])?
     .dangerous()
     .with_custom_certificate_verifier(verifier)
-    .with_client_cert_resolver(Arc::new(AlwaysResolvesClientRawPublicKeys::new(
+    .with_client_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
         identity.certified_key.clone(),
     )));
     tls.alpn_protocols = vec![ALPN.to_vec()];
@@ -193,59 +187,4 @@ pub fn client_config(identity: &Identity, peer: &PublicKey) -> Result<ClientConf
     Ok(config)
 }
 
-fn hello(config: &Config) -> [u8; 16] {
-    let mut bytes = [0u8; 16];
-    bytes[..4].copy_from_slice(b"QW01");
-    bytes[4..8].copy_from_slice(&config.tun_address.addr().octets());
-    bytes[8..12].copy_from_slice(&config.peer_address.octets());
-    bytes[12..14].copy_from_slice(&config.mtu.to_be_bytes());
-    bytes
-}
-
-fn check_hello(bytes: &[u8], config: &Config) -> Result<()> {
-    ensure!(
-        bytes.len() == 16 && &bytes[..4] == b"QW01",
-        "隧道握手格式或版本错误"
-    );
-    ensure!(
-        bytes[4..8] == config.peer_address.octets()
-            && bytes[8..12] == config.tun_address.addr().octets(),
-        "两端隧道地址配置不匹配"
-    );
-    ensure!(
-        bytes[12..14] == config.mtu.to_be_bytes() && bytes[14..16] == [0, 0],
-        "MTU 或保留字段不匹配"
-    );
-    Ok(())
-}
-
-/// TLS 完成后交换固定长度握手，确认双向认证、地址与 MTU，再放行数据。
-pub async fn negotiate(connection: &Connection, config: &Config) -> Result<()> {
-    let result = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        ensure!(
-            connection.max_datagram_size().unwrap_or(0) >= usize::from(config.mtu),
-            "对端 DATAGRAM 能力不足"
-        );
-        let (mut send, mut receive) = match config.mode {
-            Mode::Client => connection.open_bi().await?,
-            Mode::Server => connection.accept_bi().await?,
-        };
-        if config.mode == Mode::Client {
-            send.write_all(&hello(config)).await?;
-            send.finish()?;
-            check_hello(&receive.read_to_end(16).await?, config)?;
-        } else {
-            check_hello(&receive.read_to_end(16).await?, config)?;
-            send.write_all(&hello(config)).await?;
-            send.finish()?;
-        }
-        Ok::<(), anyhow::Error>(())
-    })
-    .await
-    .context("隧道握手超时")
-    .and_then(|result| result);
-    if result.is_err() {
-        connection.close(1_u32.into(), b"invalid tunnel handshake");
-    }
-    result
-}
+pub use crate::http3::negotiate;

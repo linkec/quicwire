@@ -91,7 +91,7 @@ pub async fn run(config: Config, identity: Identity) -> Result<()> {
         .context("无法创建 TUN，需要 root 或 CAP_NET_ADMIN")?;
     // 限制 TUN 发送积压，避免背压把延迟转移到内核队列。
     device.set_tx_queue_len(64)?;
-    let (active, current) = watch::channel(None::<Connection>);
+    let (active, current) = watch::channel(None::<crate::http3::ActiveSession>);
     let counters = Counters::default();
     eprintln!(
         "已启动 mode={:?} bind={} tun={} address={} mtu={}",
@@ -119,7 +119,7 @@ pub async fn run(config: Config, identity: Identity) -> Result<()> {
 async fn send_packets(
     device: &AsyncDevice,
     config: &Config,
-    active: watch::Receiver<Option<Connection>>,
+    active: watch::Receiver<Option<crate::http3::ActiveSession>>,
     counters: &Counters,
 ) -> Result<()> {
     let mut original = vec![0u8; 65535 + VIRTIO_NET_HDR_LEN];
@@ -153,7 +153,8 @@ async fn send_packets(
             // 等待空间，避免 TCP 突发被小发送队列直接丢弃。
             // 连接关闭会唤醒等待；外层 select 仍可处理退出和接收。
             let result = connection
-                .send_datagram_wait(packet[..length].to_vec().into())
+                .connection
+                .send_datagram_wait(connection.encode(&packet[..length]))
                 .await;
             match result {
                 Ok(()) => {
@@ -171,15 +172,17 @@ async fn manage_connections(
     endpoint: &Endpoint,
     device: &AsyncDevice,
     config: &Config,
-    active: watch::Sender<Option<Connection>>,
+    active: watch::Sender<Option<crate::http3::ActiveSession>>,
     counters: &Counters,
 ) -> Result<()> {
     let mut backoff = 1u64;
     loop {
         let connected: Result<Connection> = match config.mode {
             Mode::Client => {
-                let connecting =
-                    endpoint.connect(config.endpoint.context("缺少 endpoint")?, "quicwire")?;
+                let connecting = endpoint.connect(
+                    config.endpoint.context("缺少 endpoint")?,
+                    &config.tls_server_name()?,
+                )?;
                 tokio::time::timeout(transport::HANDSHAKE_TIMEOUT, connecting)
                     .await
                     .context("QUIC 握手超时")
@@ -195,15 +198,15 @@ async fn manage_connections(
         };
         let session = async {
             let connection = connected?;
-            transport::negotiate(&connection, config).await?;
+            let mut h3_session = transport::negotiate(&connection, config).await?;
             eprintln!(
                 "隧道已连接 peer={} remote={}",
                 config.peer_address,
                 connection.remote_address()
             );
-            active.send_replace(Some(connection.clone()));
+            active.send_replace(Some(h3_session.active.clone()));
             backoff = 1;
-            let result = receive_packets(endpoint, &connection, device, config, counters).await;
+            let result = receive_packets(endpoint, &mut h3_session, device, config, counters).await;
             active.send_replace(None);
             connection.close(0_u32.into(), b"session ended");
             result
@@ -222,33 +225,34 @@ async fn manage_connections(
 
 async fn receive_packets(
     endpoint: &Endpoint,
-    connection: &Connection,
+    session: &mut crate::http3::Session,
     device: &AsyncDevice,
     config: &Config,
     counters: &Counters,
 ) -> Result<()> {
+    let active = session.active.clone();
     let mut gro = GROTable::default();
     let mut packets: Vec<Vec<u8>> = (0..IDEAL_BATCH_SIZE)
         .map(|_| Vec::with_capacity(65535 + VIRTIO_NET_HDR_LEN))
         .collect();
     loop {
         tokio::select! {
-            data = connection.read_datagram() => {
+            data = session.read_datagram() => {
                 let mut data = data?;
                 let mut count = 0;
                 for index in 0..IDEAL_BATCH_SIZE {
-                    if valid_ipv4(&data, config.peer_address, config.tun_address.addr(), config.mtu) {
+                    if let Some(payload) = active.decode(&data).filter(|packet| valid_ipv4(packet, config.peer_address, config.tun_address.addr(), config.mtu)) {
                         let packet = &mut packets[count];
                         packet.clear();
                         packet.resize(VIRTIO_NET_HDR_LEN, 0);
-                        packet.extend_from_slice(&data);
+                        packet.extend_from_slice(payload);
                         count += 1;
                     } else {
                         counters.invalid.fetch_add(1, Ordering::Relaxed);
                     }
                     if index + 1 == IDEAL_BATCH_SIZE { break; }
                     let next = poll_fn(|cx| {
-                        let mut read = pin!(connection.read_datagram());
+                        let mut read = pin!(session.read_datagram());
                         Poll::Ready(match read.as_mut().poll(cx) {
                             Poll::Ready(value) => Some(value),
                             Poll::Pending => None,
@@ -268,7 +272,10 @@ async fn receive_packets(
     }
 }
 
-async fn log_periodically(counters: &Counters, active: watch::Receiver<Option<Connection>>) {
+async fn log_periodically(
+    counters: &Counters,
+    active: watch::Receiver<Option<crate::http3::ActiveSession>>,
+) {
     let mut interval = tokio::time::interval_at(
         tokio::time::Instant::now() + Duration::from_secs(10),
         Duration::from_secs(10),
@@ -278,7 +285,7 @@ async fn log_periodically(counters: &Counters, active: watch::Receiver<Option<Co
         interval.tick().await;
         counters.log();
         if let Some(connection) = active.borrow().as_ref() {
-            let stats = connection.stats();
+            let stats = connection.connection.stats();
             eprintln!(
                 "QUIC统计 rtt_us={} cwnd={} sent={} lost={} rx_datagrams={}",
                 stats.path.rtt.as_micros(),
