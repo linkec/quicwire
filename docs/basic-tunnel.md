@@ -84,4 +84,4 @@ cargo build --locked
 sudo bash scripts/linux-smoke.sh target/debug/quicwire
 ```
 
-协议测试覆盖真实双向 TLS、公钥错误、仅复制公钥的私钥冒用、HELLO 配置不匹配与超长消息；同时检查配置、密钥文件及 IP 包校验。Linux smoke 测试覆盖真实双向 TUN、MTU 边界、退出清理和服务端重启恢复。PVE 双机实测另行记录。
+协议测试覆盖真实双向 TLS、公钥错误、仅复制公钥的私钥冒用、HELLO 配置不匹配与超长消息；同时检查配置、密钥文件及 IP 包校验。Linux smoke 测试覆盖真实双向 TUN、MTU 边界、退出清理和服务端重启恢复。PVE 双机结果见 [实测记录](testing.md)。
