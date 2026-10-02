@@ -37,7 +37,7 @@ impl Counters {
 
 pub async fn run(config: Config, identity: Identity) -> Result<()> {
     let peer = PublicKey::parse(&config.peer_public_key)?;
-    let mut endpoint = match config.mode {
+    let endpoint = match config.mode {
         Mode::Server => Endpoint::server(transport::server_config(&identity, &peer)?, config.bind)?,
         Mode::Client => {
             let mut endpoint = Endpoint::client(config.bind)?;
