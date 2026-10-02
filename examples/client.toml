@@ -1,0 +1,9 @@
+mode = "client"
+bind = "0.0.0.0:0"
+endpoint = "192.0.2.1:4433" # 替换为服务器实际地址
+private_key_file = "client.key"
+peer_public_key = "替换为服务端 keygen 输出的完整公钥"
+tun_name = "qw0"
+tun_address = "10.77.0.2/30"
+peer_address = "10.77.0.1"
+mtu = 1100

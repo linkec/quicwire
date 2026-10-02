@@ -20,3 +20,14 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: 测试
         run: cargo test --locked --all-targets
+      - name: 构建 Linux 二进制
+        run: cargo build --release --locked
+      - name: 真实 TUN 与故障恢复检查
+        run: sudo bash scripts/linux-smoke.sh target/release/quicwire
+      - name: 保存 Linux 测试构建
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: quicwire-linux-x86_64
+          path: target/release/quicwire
+          if-no-files-found: error
+          retention-days: 14

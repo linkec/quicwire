@@ -10,4 +10,18 @@ readme = "README.md"
 
 [dependencies]
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal", "io-util"] }
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+ipnet = { version = "2", features = ["serde"] }
+ring = "0.17"
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tun = { version = "0.8", features = ["async"] }
+
+[dev-dependencies]
+tempfile = "3"

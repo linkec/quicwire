@@ -1,47 +1,34 @@
 # quicwire
 
-使用 **Rust + Quinn** 开发的独立多路径 QUIC 冗余 IP 隧道。
+基于 **Rust + Quinn** 的独立 QUIC IP 隧道，使用本地公私钥和预配置 peer 公钥，不依赖认证 API、账号或数据库。
 
-两端像 WireGuard 一样预先配置对端公钥。客户端通过多个边缘接入点连接核心服务器；同一个 IP 包在多条独立 QUIC 连接上发送，接收端只交付最先收到的有效副本。
-
-> 当前处于需求与设计阶段。用户要求先完成全部设计，再进入开发：需求边界、协议、异常行为、配置与验收标准经评审确认后，才开始实现。现有代码仅为工程骨架。
-
-## 设计方向
-
-- **公私钥身份**：私钥本地保存，通过预配置的 peer 公钥授权，无账号系统、认证 API 或外部签发凭证。
-- **双向冗余**：上行和下行都支持 K 份副本，按 session 和方向去重。
-- **独立路径**：每条路径使用独立 QUIC 连接，在应用层绑定为一个逻辑 session。
-- **路径隔离**：独立有界发送队列；拥塞路径不阻塞其他路径。
-- **动态选路**：控制链交换测量结果、路径集合及多发份数。
-- **可调整拥塞控制**：使用 Quinn 的公开接口；通过真实线路测试选择算法。
-
-quicwire 借鉴 WireGuard 的 peer 配置方式，传输协议使用 QUIC；不承诺 WireGuard 协议或密钥格式兼容。
+当前已实现基础版：Linux 两台主机之间的单路径 QUIC DATAGRAM + IPv4 TUN，包含双向公钥认证、配置校验、自动重连、源地址约束和 systemd 示例。多路径复制、去重和动态选路仍在设计中。
 
 ```mermaid
 flowchart LR
-    C[客户端：TUN、选路、多发与去重]
-    E1[边缘 1：UDP 转发]
-    E2[边缘 2：UDP 转发]
-    E3[边缘 3：UDP 转发]
-    S[核心：认证、绑定、去重与转发]
-    N[目标网络]
-    C <-->|QUIC 连接 1| E1 <--> S
-    C <-->|QUIC 连接 2| E2 <--> S
-    C <-->|QUIC 连接 3| E3 <--> S
-    S <--> N
+    A[客户端主机 IPv4] <--> AT[TUN]
+    AT <-->|QUIC DATAGRAM · 双向公钥认证| BT[TUN]
+    BT <--> B[服务端主机 IPv4]
 ```
 
-## 本地构建
-
-安装 Rust 工具链后，在仓库根目录运行：
+## 快速开始
 
 ```sh
-cargo build --locked
-cargo run --locked -- --help
-cargo run --locked -- --version
+cargo build --release --locked
+target/release/quicwire --help
+target/release/quicwire keygen --out local.key
 ```
 
-工具链由 `rust-toolchain.toml` 固定，依赖版本由 `Cargo.lock` 固定。当前命令只展示帮助与版本，不启动网络服务。
+两端分别生成密钥，交换并配置对端公钥。服务端和客户端配置参考 [examples/server.toml](examples/server.toml) 与 [examples/client.toml](examples/client.toml)，替换公钥及服务器地址后运行：
+
+```sh
+quicwire check --config quicwire.toml
+sudo quicwire run --config quicwire.toml
+```
+
+完整配置、systemd 安装、协议格式、故障行为与验证命令见 [基础隧道文档](docs/basic-tunnel.md)。TUN 数据面目前只支持 Linux；macOS 可使用密钥工具及配置检查。
+
+基础版只传输两端主机的隧道地址流量，内层 MTU 默认 1100；不配置默认路由、NAT 或第三方子网转发。公钥配置方式借鉴 WireGuard，使用 Ed25519 + TLS 1.3 Raw Public Key，协议与密钥格式均独立。
 
 ## 开发检查
 
@@ -49,16 +36,20 @@ cargo run --locked -- --version
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
+cargo build --locked
+sudo bash scripts/linux-smoke.sh target/debug/quicwire
 ```
 
-当前尚无功能测试；实现协议与数据面时同步增加相应测试。
+Rust 版本和依赖分别由 `rust-toolchain.toml`、`Cargo.lock` 固定。CI 在 Linux 执行以上检查并生成 release 构建。
 
-## 文档
+## 后续设计
+
+用户于 2026-10-02 调整顺序，先交付基础 QUIC + TUN 隧道并做双机测试。以下文档保留多路径目标和未决事项，不能据此认为完整多路径能力已经实现：
 
 - [需求与验收边界](docs/requirements.md)
 - [Rust + Quinn 选型记录](docs/architecture.md)
 - [设计决策与评审清单](docs/design-review.md)
-- [验收场景草案](docs/acceptance.md)
+- [多路径验收场景草案](docs/acceptance.md)
 - [设计与实施顺序](docs/roadmap.md)
 
 ## 许可
