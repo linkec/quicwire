@@ -139,7 +139,8 @@ fn transport() -> Arc<TransportConfig> {
     config.max_concurrent_uni_streams(0_u8.into());
     config.stream_receive_window(4096_u32.into());
     config.receive_window(8192_u32.into());
-    config.datagram_receive_buffer_size(Some(256 * 1024));
+    // 接收突发与处理速度解耦；发送端保持小缓冲并采用背压。
+    config.datagram_receive_buffer_size(Some(1024 * 1024));
     config.datagram_send_buffer_size(64 * 1024);
     config.keep_alive_interval(Some(Duration::from_secs(2)));
     config.max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("固定超时有效")));

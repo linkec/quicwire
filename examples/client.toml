@@ -7,3 +7,6 @@ tun_name = "qw0"
 tun_address = "10.77.0.2/30"
 peer_address = "10.77.0.1"
 mtu = 1100
+
+# Linux TUN 分段／合并；不支持 offload 时可关闭
+tun_offload = true

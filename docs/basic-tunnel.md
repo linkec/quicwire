@@ -36,7 +36,7 @@ sudo quicwire run --config /etc/quicwire/quicwire.toml
 
 `check` 只检查配置及密钥，不创建接口或连接。`pubkey --private-key PATH` 可重新输出已有私钥对应的公钥。`keygen` 不覆盖已有文件。
 
-配置字段全部见示例。未知字段视为错误；私钥相对路径按配置所在目录解析；隧道前缀限 `/24` 至 `/30`，两个地址必须在同一网段且不同。`mtu` 默认 1100，允许 576–1100，两端必须一致。客户端外层 endpoint 不得在隧道网段内，避免递归路由。
+配置字段全部见示例。未知字段视为错误；私钥相对路径按配置所在目录解析；隧道前缀限 `/24` 至 `/30`，两个地址必须在同一网段且不同。`mtu` 默认 1100，允许 576–1100，两端必须一致。客户端外层 endpoint 不得在隧道网段内，避免递归路由。`tun_offload` 默认 `true`，启用 Linux TUN 的分段／合并；不支持的环境可设为 `false`，两端不必一致。
 
 ## systemd
 
@@ -67,11 +67,15 @@ HELLO 占 16 字节，通过客户端开启的唯一双向 stream 交换，发�
 
 外层 UDP payload 固定初始及最小大小 1200，关闭路径 MTU 探测；内层 MTU 1100 留出 QUIC 开销。路径必须承载标准 QUIC 最小 UDP payload。运行前检查协商后的 DATAGRAM 容量足够。
 
-拥塞控制使用 Quinn 默认 Cubic。DATAGRAM 发送缓冲 64 KiB、接收缓冲 256 KiB；发送缓冲不足时丢弃当前包，不阻塞 TUN 读取。断开期间读取并丢弃 TUN 包，不保存待恢复流量。QUIC 自身的接收缓冲丢包不包含在应用丢包计数中。
+拥塞控制使用 Quinn 默认 Cubic。DATAGRAM 发送缓冲 64 KiB、接收缓冲 1 MiB；发送缓冲不足时等待空间，对 TUN 读取施加背压。TUN 发送队列限制为 64，避免无限积压；过载时内核队列或 QUIC 接收队列仍可能丢包。断开期间读取并丢弃 TUN 包，不保存待恢复流量。等待发送可被连接关闭或进程退出打断。QUIC 自身的接收缓冲丢包不包含在应用丢包计数中。
+
+数据面使用单线程 Tokio 事件循环，以及 tun-rs 的 GSO 分段／GRO 合并；接收合并每批最多处理 128 包；发送分段缓冲按 MTU 留足容量，包括低 MTU 和较长 IP/TCP options 的情况。收到第一个 QUIC DATAGRAM 后只合并已经就绪的数据，不为凑批而等待。大 TUN 包在发送前拆成独立、经过地址与 MTU 校验的 IPv4 包，线上的 DATAGRAM 格式保持不变。
+
+程序为自身 UDP socket 请求各 7 MiB 收发缓冲，并在具备 `CAP_NET_ADMIN` 时使用 Linux 的 `SO_RCVBUFFORCE` / `SO_SNDBUFFORCE`。权限不足时保留系统允许的普通设置，不修改全局 sysctl。启动日志输出实际缓冲大小，Linux 返回值包含内部加倍的部分。缓冲是容量上限，不是预先填充的固定延迟；满载延迟仍需要单独测量。
 
 TLS 和 HELLO 各有 10 秒上限，空闲超时 6 秒，保活间隔 2 秒。客户端失败后按 1、2、4、8 秒退避，最高 8 秒；成功建立隧道后重置。实际恢复时间受超时、退避、RTT 和调度影响，不承诺亚秒切换。服务端有活动隧道时拒绝新连接；客户端意外重启可能要等旧连接超时。服务端最多容纳 16 个待处理 incoming，串行认证，尚未提供公网抗拒绝服务的完整防护。
 
-每 10 秒输出累计收发及丢弃计数；`tx_queued` 表示进入 QUIC 队列，`rx_delivered` 表示写入 TUN，不代表应用实际消费或远端确认。SIGINT/SIGTERM 正常关闭 QUIC 并释放 TUN，进程异常退出时内核也会关闭非持久 TUN fd。
+每 10 秒输出累计收发及丢弃计数，以及 QUIC RTT、拥塞窗口、发送／丢失包数和接收 DATAGRAM 数；`tx_queued` 表示进入 QUIC 队列，`rx_delivered` 表示写入 TUN，不代表应用实际消费或远端确认。SIGINT/SIGTERM 正常关闭 QUIC 并释放 TUN，进程异常退出时内核也会关闭非持久 TUN fd。
 
 ## 验证
 
@@ -79,9 +83,9 @@ TLS 和 HELLO 各有 10 秒上限，空闲超时 6 秒，保活间隔 2 秒。�
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked --all-targets
-# Linux，需 root、iproute2 和 ping；只在临时 namespace 创建接口和路由
+# Linux，需 root、iproute2、ping 和 Python 3；只在临时 namespace 创建接口和路由
 cargo build --locked
 sudo bash scripts/linux-smoke.sh target/debug/quicwire
 ```
 
-协议测试覆盖真实双向 TLS、公钥错误、仅复制公钥的私钥冒用、HELLO 配置不匹配与超长消息；同时检查配置、密钥文件及 IP 包校验。Linux smoke 测试覆盖真实双向 TUN、MTU 边界、退出清理和服务端重启恢复。PVE 双机结果见 [实测记录](testing.md)。
+协议测试覆盖真实双向 TLS、公钥错误、仅复制公钥的私钥冒用、HELLO 配置不匹配与超长消息；同时检查配置、密钥文件及 IP 包校验。Linux smoke 测试覆盖真实双向 TUN、MTU 边界、4 MiB TCP 双向内容校验、UDP 小包及 IPv4 分片回传、退出清理和服务端重启恢复。PVE 双机结果见 [实测记录](testing.md)。

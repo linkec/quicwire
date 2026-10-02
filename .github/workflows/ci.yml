@@ -23,7 +23,10 @@ jobs:
       - name: 构建 Linux 二进制
         run: cargo build --release --locked
       - name: 真实 TUN 与故障恢复检查
-        run: sudo bash scripts/linux-smoke.sh target/release/quicwire
+        run: |
+          sudo bash scripts/linux-smoke.sh target/release/quicwire
+          sudo env QUICWIRE_TEST_MTU=576 bash scripts/linux-smoke.sh target/release/quicwire
+          sudo env QUICWIRE_TEST_OFFLOAD=false bash scripts/linux-smoke.sh target/release/quicwire
       - name: 保存 Linux 测试构建
         uses: actions/upload-artifact@v7.0.1
         with:

@@ -21,7 +21,8 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tun = { version = "0.8", features = ["async"] }
+nix = { version = "0.31", features = ["socket"] }
+tun-rs = { version = "=2.8.11", features = ["async_tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

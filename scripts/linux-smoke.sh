@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # 在独立 network namespace 内验证真实 TUN，不修改宿主机路由。
 set -euo pipefail
+mtu="${QUICWIRE_TEST_MTU:-1100}"
+[[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu >= 576 && mtu <= 1100 )) || exit 1
+script_dir=$(cd -- "$(dirname -- "$0")" && pwd)
 binary=$(realpath "${1:-target/debug/quicwire}")
 [[ $EUID -eq 0 ]] || { echo '需要 root 创建测试 network namespace' >&2; exit 1; }
 work=$(mktemp -d)
@@ -8,11 +11,12 @@ server_ns="qws-$$"
 client_ns="qwc-$$"
 server_pid=''
 client_pid=''
+payload_pid=''
 cleanup() {
   status=$?
   trap - EXIT
   if (( status != 0 )); then cat "$work"/*.log 2>/dev/null || true; fi
-  for pid in "$client_pid" "$server_pid"; do
+  for pid in "$payload_pid" "$client_pid" "$server_pid"; do
     if [[ -n $pid ]]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
   done
   ip netns del "$client_ns" 2>/dev/null || true
@@ -41,7 +45,8 @@ peer_public_key = "$client_public"
 tun_name = "qw0"
 tun_address = "10.77.0.1/30"
 peer_address = "10.77.0.2"
-mtu = 1100
+mtu = $mtu
+tun_offload = ${QUICWIRE_TEST_OFFLOAD:-true}
 EOF
 cat > "$work/client.toml" <<EOF
 mode = "client"
@@ -52,7 +57,8 @@ peer_public_key = "$server_public"
 tun_name = "qw0"
 tun_address = "10.77.0.2/30"
 peer_address = "10.77.0.1"
-mtu = 1100
+mtu = $mtu
+tun_offload = ${QUICWIRE_TEST_OFFLOAD:-true}
 EOF
 start_server() {
   ip netns exec "$server_ns" "$binary" run --config "$work/server.toml" >> "$work/server.log" 2>&1 &
@@ -69,11 +75,31 @@ start_server
 ip netns exec "$client_ns" "$binary" run --config "$work/client.toml" > "$work/client.log" 2>&1 &
 client_pid=$!
 wait_connected
-ip netns exec "$client_ns" ping -c 3 -W 2 -M do -s 1072 10.77.0.1
+ip netns exec "$client_ns" ping -c 3 -W 2 -M do -s "$((mtu-28))" 10.77.0.1
 ip netns exec "$server_ns" ping -c 3 -W 2 10.77.0.2
-if ip netns exec "$client_ns" ping -c 1 -W 1 -M do -s 1073 10.77.0.1; then
+if ip netns exec "$client_ns" ping -c 1 -W 1 -M do -s "$((mtu-27))" 10.77.0.1; then
   echo '超 MTU 包意外成功' >&2; exit 1
 fi
+# 大 TCP 写入触发 GSO；回传检查 GRO 内容，UDP 覆盖 IPv4 分片。
+for side in server client; do
+  if [[ "$side" == server ]]; then
+    target_ns="$server_ns"; source_ns="$client_ns"; target_ip=10.77.0.1
+  else
+    target_ns="$client_ns"; source_ns="$server_ns"; target_ip=10.77.0.2
+  fi
+  rm -f "$work/payload-ready"
+  ip netns exec "$target_ns" python3 "$script_dir/payload-check.py" server "$target_ip" "$work/payload-ready" &
+  payload_pid=$!
+  for attempt in $(seq 1 100); do
+    [[ -f "$work/payload-ready" ]] && break
+    kill -0 "$payload_pid" 2>/dev/null || { echo '内容校验服务启动失败' >&2; exit 1; }
+    sleep 0.05
+  done
+  [[ -f "$work/payload-ready" ]] || { echo '内容校验服务启动超时' >&2; exit 1; }
+  ip netns exec "$source_ns" python3 "$script_dir/payload-check.py" client "$target_ip"
+  wait "$payload_pid"
+  payload_pid=''
+done
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=''

@@ -18,6 +18,7 @@ fn config(mode: Mode, peer: &PublicKey) -> Config {
         tun_address: format!("10.77.0.{local}/30").parse().unwrap(),
         peer_address: format!("10.77.0.{remote}").parse().unwrap(),
         mtu: 1100,
+        tun_offload: true,
     }
 }
 
@@ -234,4 +235,15 @@ fn packet_validation_rejects_spoofing_truncation_and_ipv6() {
     packet[0] = 0x44;
     assert!(!valid_ipv4(&packet, source, dest, 1100));
     assert!(!valid_ipv4(&[], source, dest, 1100));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn data_plane_rejects_invalid_mtu_before_creating_devices() {
+    let (identity, _) = Identity::generate().unwrap();
+    let (peer, _) = Identity::generate().unwrap();
+    let mut cfg = config(Mode::Client, &peer.public);
+    cfg.mtu = 100;
+    let error = quicwire::tunnel::run(cfg, identity).await.unwrap_err();
+    assert!(error.to_string().contains("MTU"));
 }

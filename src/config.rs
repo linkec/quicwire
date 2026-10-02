@@ -27,6 +27,13 @@ pub struct Config {
     pub peer_address: Ipv4Addr,
     #[serde(default = "default_mtu")]
     pub mtu: u16,
+    /// Linux TUN 的 TCP/UDP 分段与合并；兼容不支持 offload 的环境时可关闭。
+    #[serde(default = "default_tun_offload")]
+    pub tun_offload: bool,
+}
+
+fn default_tun_offload() -> bool {
+    true
 }
 
 fn default_mtu() -> u16 {

@@ -38,7 +38,7 @@ enum Command {
     },
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Keygen { out } => println!("{}", Identity::generate_file(&out)?.encode()),
