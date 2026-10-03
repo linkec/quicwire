@@ -247,6 +247,7 @@ pub struct Status {
     pub fec_backup_failover: Option<bool>,
     pub fec_failover_active: Option<bool>,
     pub fec: u8,
+    pub fec_repair_shards: u8,
     pub fec_expired_groups: u64,
     pub fec_evictions: u64,
     pub mode: String,
@@ -419,6 +420,7 @@ impl Shared {
                     .is_some_and(|id| s.paths.get(id).is_some_and(|p| p.backup))
             }),
             fec: self.config.fec,
+            fec_repair_shards: self.config.fec_repair_shards,
             fec_expired_groups: s.fec_decoder.expired_missing,
             fec_evictions: s.fec_decoder.evictions,
             mode: format!("{:?}", self.config.mode).to_lowercase(),
@@ -1413,7 +1415,7 @@ async fn send_loop(
             return Err(error.into());
         }
         let mut s = shared.state.lock().unwrap();
-        if data.first() == Some(&fec::REPAIR) {
+        if fec::is_repair(data.first()) {
             s.counters.fec_tx_packets += 1;
             s.counters.fec_tx_bytes += data.len() as u64;
         } else {
@@ -1421,7 +1423,7 @@ async fn send_loop(
             s.counters.tx_data_bytes += data.len() as u64;
         }
         if let Some(p) = s.paths.get_mut(&id) {
-            if data.first() != Some(&fec::REPAIR) {
+            if !fec::is_repair(data.first()) {
                 p.tx_copies += 1;
             } else {
                 p.fec_tx_packets += 1;
@@ -1559,11 +1561,16 @@ impl PathReceiver<'_> {
                     false,
                 );
             }
-            fec::DATA | fec::REPAIR if self.config.fec > 0 => {
+            fec::DATA | fec::REPAIR | fec::INDEPENDENT_REPAIR if self.config.fec > 0 => {
                 let Some(frame) = Frame::parse(payload, self.config.mtu as usize) else {
                     self.shared.counters(|c| c.invalid += 1);
                     return Ok(());
                 };
+                if matches!(&frame, Frame::Repair{index,..} if *index >= self.config.fec_repair_shards as usize)
+                {
+                    self.shared.counters(|c| c.invalid += 1);
+                    return Ok(());
+                }
                 if let Frame::Data {
                     base,
                     index,
@@ -1591,9 +1598,12 @@ impl PathReceiver<'_> {
                     .fec_decoder
                     .receive(frame, Instant::now());
                 match recovered {
-                    Ok(Some((seq, packet))) => self.deliver(seq, packet, true),
+                    Ok(packets) => {
+                        for (seq, packet) in packets {
+                            self.deliver(seq, packet, true);
+                        }
+                    }
                     Err(_) => self.shared.counters(|c| c.invalid += 1),
-                    _ => (),
                 }
             }
             4 if !client => {
@@ -1714,12 +1724,17 @@ pub struct FecSender {
     encoder: Encoder,
 }
 impl FecSender {
+    pub fn new(repair_shards: u8) -> Self {
+        Self {
+            encoder: Encoder::new(repair_shards as usize),
+        }
+    }
     pub fn deadline(&self) -> Option<Instant> {
         self.encoder.deadline()
     }
     fn repair(
         &mut self,
-        data: Bytes,
+        data: Vec<Bytes>,
         selected: &watch::Receiver<Vec<PathSender>>,
         shared: &Shared,
     ) {
@@ -1729,20 +1744,21 @@ impl FecSender {
             .filter(|p| !p.primary)
             .cloned()
             .collect();
-        // 同一份校验最多发 3 份，先分散到不同激活路径；路径不足时循环复用。
-        // 每份只成功入队一次；排队失败时尝试其它激活备用，不阻塞原始数据。
+        // 先轮询独立校验，再发送下一轮副本；优先把不同校验分散到不同备用。
         let count = paths.len();
         for copy in 0..shared.config.fec as usize {
-            let mut sent = false;
-            for offset in 0..count {
-                let p = &paths[(copy + offset) % count];
-                if p.sender.try_send(data.clone()).is_ok() {
-                    sent = true;
-                    break;
+            for (shard, frame) in data.iter().enumerate() {
+                let mut sent = false;
+                for offset in 0..count {
+                    let p = &paths[(copy + shard + offset) % count];
+                    if p.sender.try_send(frame.clone()).is_ok() {
+                        sent = true;
+                        break;
+                    }
                 }
-            }
-            if !sent {
-                shared.counters(|c| c.fec_queue_drops += 1);
+                if !sent {
+                    shared.counters(|c| c.fec_queue_drops += 1);
+                }
             }
         }
     }
@@ -2756,7 +2772,11 @@ mod tests {
                     repair = e.push(seq, p.slice(9..), Instant::now());
                 }
                 // 模拟中间一个原始业务包丢失，校验通过另一条真实 H3/QUIC 连接发送。
-                paths[1].sender.send(repair.unwrap()).await.unwrap();
+                paths[1]
+                    .sender
+                    .send(repair.unwrap().remove(0))
+                    .await
+                    .unwrap();
                 for i in [3, 0, 2] {
                     paths[0].sender.send(frames[i].clone()).await.unwrap();
                 }
@@ -3008,6 +3028,143 @@ peer_address = "10.77.0.1"
     }
 
     #[tokio::test]
+    async fn fec_independent_shards_recover_two_over_real_h3_and_distribute_repairs() {
+        for copies in 1..=3 {
+            let (sid, _) = Identity::generate().unwrap();
+            let (cid, _) = Identity::generate().unwrap();
+            let port = free_ports();
+            let mut sc = config(Mode::Server, &cid.public, port);
+            sc.bind = "0.0.0.0:0".parse().unwrap();
+            sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
+            sc.fec = copies;
+            sc.fec_repair_shards = 2;
+            let mut cc = config(Mode::Client, &sid.public, port);
+            cc.endpoints = sc.listen.iter().cloned().map(Into::into).collect();
+            cc.max_sessions = 3;
+            cc.active_sessions = 3;
+            cc.fec = copies;
+            cc.fec_repair_shards = 2;
+            cc.stable_session_ttl_secs = 0;
+            cc.switch_threshold_percent = 99.9;
+            let mut server = Multipath::start(sc, sid).unwrap();
+            let mut client = Multipath::start(cc, cid).unwrap();
+            until(|| client.shared.snapshot().active == 3 && server.shared.snapshot().active == 3)
+                .await;
+            for reverse in [false, true] {
+                let (source, dest) = if reverse {
+                    (&mut server, &mut client)
+                } else {
+                    (&mut client, &mut server)
+                };
+                let paths = source.selected.borrow().clone();
+                let mut encoder = Encoder::new(2);
+                let mut frames = Vec::new();
+                let mut parity = None;
+                for seq in 1..=4 {
+                    let p = packet(seq, reverse);
+                    frames.push(encoder.data(seq, &p[9..]));
+                    parity = encoder.push(seq, p.slice(9..), Instant::now());
+                }
+                let parity = parity.unwrap();
+                for i in [0, 3] {
+                    paths[0].sender.send(frames[i].clone()).await.unwrap();
+                }
+                // 同一校验发多份仍不能恢复两个缺包。
+                for _ in 0..3 {
+                    paths[1].sender.send(parity[0].clone()).await.unwrap();
+                }
+                for _ in 0..2 {
+                    tokio::time::timeout(Duration::from_secs(1), dest.received.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), dest.received.recv())
+                        .await
+                        .is_err()
+                );
+                paths[2].sender.send(parity[1].clone()).await.unwrap();
+                for _ in 0..2 {
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(1), dest.received.recv())
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        packet(1, reverse).slice(9..)
+                    );
+                }
+                until(|| dest.shared.snapshot().counters.fec_recovered_packets == 2).await;
+                for i in [1, 2] {
+                    paths[0].sender.send(frames[i].clone()).await.unwrap();
+                }
+                until(|| dest.shared.snapshot().counters.duplicates == 2).await;
+                // 未协商的校验序号必须拒绝。
+                let before_invalid = dest.shared.snapshot().counters.invalid;
+                let mut illegal = parity[1].to_vec();
+                illegal[10] = 2;
+                paths[2].sender.send(illegal.into()).await.unwrap();
+                until(|| dest.shared.snapshot().counters.invalid == before_invalid + 1).await;
+                let before = source.shared.snapshot();
+                let mut sender = FecSender::new(2);
+                let mut selected = source.selected.clone();
+                for seq in 10..14 {
+                    assert!(
+                        sender
+                            .send(packet(seq, reverse), &mut selected, &source.shared)
+                            .await
+                    );
+                }
+                for _ in 0..4 {
+                    tokio::time::timeout(Duration::from_secs(1), dest.received.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                until(|| {
+                    source.shared.snapshot().counters.fec_tx_packets
+                        == before.counters.fec_tx_packets + 2 * u64::from(copies)
+                })
+                .await;
+                let after = source.shared.snapshot();
+                for path in after.paths {
+                    let old = before.paths.iter().find(|p| p.id == path.id).unwrap();
+                    if path.selection_role == Some("primary") {
+                        assert_eq!(path.tx_copies - old.tx_copies, 4);
+                        assert_eq!(path.fec_tx_packets - old.fec_tx_packets, 0);
+                    } else {
+                        assert_eq!(path.tx_copies - old.tx_copies, 0);
+                        assert_eq!(path.fec_tx_packets - old.fec_tx_packets, u64::from(copies));
+                    }
+                }
+            }
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+    #[tokio::test]
+    async fn fec_independent_shard_mismatch_rejected_before_registration() {
+        let (sid, _) = Identity::generate().unwrap();
+        let (cid, _) = Identity::generate().unwrap();
+        let port = free_ports();
+        let mut sc = config(Mode::Server, &cid.public, port);
+        sc.fec = 1;
+        sc.fec_repair_shards = 1;
+        let mut cc = config(Mode::Client, &sid.public, port);
+        cc.endpoints = vec![format!("127.0.0.1:{port}").into()];
+        cc.max_sessions = 2;
+        cc.active_sessions = 2;
+        cc.fec = 1;
+        cc.fec_repair_shards = 2;
+        let mut server = Multipath::start(sc, sid).unwrap();
+        let mut client = Multipath::start(cc, cid).unwrap();
+        until(|| client.shared.snapshot().connection_failures > 0).await;
+        assert_eq!(client.shared.snapshot().connected, 0);
+        assert_eq!(server.shared.snapshot().connected, 0);
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+    #[tokio::test]
     async fn fec_mismatch_rejected_before_registering_path() {
         let (sid, _) = Identity::generate().unwrap();
         let (cid, _) = Identity::generate().unwrap();
@@ -3032,12 +3189,26 @@ peer_address = "10.77.0.1"
         let mut c = config(Mode::Client, &identity.public, 4433);
         c.endpoints = vec!["127.0.0.1:4433-4434".into()];
         assert_eq!(c.fec, 0);
+        assert_eq!(c.fec_repair_shards, 1);
         c.max_sessions = 2;
         c.active_sessions = 2;
         for copies in 0..=3 {
             c.fec = copies;
             assert!(c.validate().is_ok());
         }
+        c.fec = 1;
+        for shards in 1..=4 {
+            c.fec_repair_shards = shards;
+            c.validate().unwrap();
+        }
+        for shards in [0, 5, 255] {
+            c.fec_repair_shards = shards;
+            assert!(c.validate().is_err());
+        }
+        c.fec = 0;
+        c.fec_repair_shards = 2;
+        assert!(c.validate().is_err());
+        c.fec_repair_shards = 1;
         c.fec = 4;
         assert!(c.validate().is_err());
         c.fec = 1;

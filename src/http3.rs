@@ -111,6 +111,16 @@ async fn negotiate_mode(
     Ok(session)
 }
 
+fn fec_protocol(config: &Config) -> String {
+    if config.fec_repair_shards == 1 {
+        format!("xor4-v2-primary-backup-{}", config.fec)
+    } else {
+        format!(
+            "cauchy4-v1-primary-backup-{}-{}",
+            config.fec_repair_shards, config.fec
+        )
+    }
+}
 fn headers(config: &Config, multipath: bool) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert("capsule-protocol", "?1".parse().unwrap());
@@ -127,12 +137,7 @@ fn headers(config: &Config, multipath: bool) -> HeaderMap {
         h.insert("x-tunnel-version", "3".parse().unwrap());
     }
     if config.fec > 0 {
-        h.insert(
-            "x-tunnel-fec",
-            format!("xor4-v2-primary-backup-{}", config.fec)
-                .parse()
-                .unwrap(),
-        );
+        h.insert("x-tunnel-fec", fec_protocol(config).parse().unwrap());
     }
     h
 }
@@ -151,7 +156,7 @@ fn check_headers(h: &HeaderMap, config: &Config, multipath: bool) -> Result<()> 
         if config.fec > 0 {
             h.get_all("x-tunnel-fec").iter().count() == 1
                 && h.get("x-tunnel-fec")
-                    .is_some_and(|v| v == format!("xor4-v2-primary-backup-{}", config.fec).as_str())
+                    .is_some_and(|v| v == fec_protocol(config).as_str())
         } else {
             !h.contains_key("x-tunnel-fec")
         },

@@ -62,7 +62,7 @@ async fn send_packets(
     let mut packets = vec![vec![0u8; 65535]; batch_size];
     let mut sizes = vec![0; batch_size];
     let mut sequence = 0u64;
-    let mut fec = FecSender::default();
+    let mut fec = FecSender::new(config.fec_repair_shards);
     loop {
         let deadline = fec.deadline();
         let count = tokio::select! {

@@ -31,6 +31,7 @@ fn config(mode: Mode, peer: &PublicKey) -> Config {
         mtu: 1100,
         tun_offload: true,
         fec: 0,
+        fec_repair_shards: 1,
         fec_backup_failover: false,
     }
 }

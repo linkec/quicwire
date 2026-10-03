@@ -85,14 +85,20 @@ pub struct Config {
     /// Linux TUN 的 TCP/UDP 分段与合并；兼容不支持 offload 的环境时可关闭。
     #[serde(default = "default_tun_offload")]
     pub tun_offload: bool,
-    /// 0 关闭，1–3 为每组 XOR 校验的发送份数；两端必须一致。
+    /// 0 关闭，1–3 为每份独立校验的发送副本数；两端必须一致。
     #[serde(default)]
     pub fec: u8,
+    /// 独立校验数量（1–4），fec 是每份独立校验的副本数。
+    #[serde(default = "default_fec_repair_shards")]
+    pub fec_repair_shards: u8,
     /// 客户端允许手动备用在所有主线路不可用时接管原始数据。
     #[serde(default)]
     pub fec_backup_failover: bool,
 }
 
+fn default_fec_repair_shards() -> u8 {
+    1
+}
 fn default_bind() -> SocketAddr {
     "0.0.0.0:0".parse().unwrap()
 }
@@ -156,12 +162,20 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         PublicKey::parse(&self.peer_public_key)?;
         ensure!(
+            (1..=4).contains(&self.fec_repair_shards),
+            "fec_repair_shards 必须为 1–4"
+        );
+        ensure!(
+            self.fec > 0 || self.fec_repair_shards == 1,
+            "设置多份独立校验必须启用 fec"
+        );
+        ensure!(
             !self.fec_backup_failover || (self.mode == Mode::Client && self.fec > 0),
             "fec_backup_failover 仅用于启用 FEC 的客户端"
         );
         ensure!(
             self.fec <= 3,
-            "fec 必须为 0–3：0 关闭，1–3 为每组校验副本数"
+            "fec 必须为 0–3：0 关闭，1–3 为每份独立校验副本数"
         );
         ensure!(
             self.switch_threshold_percent.is_finite()

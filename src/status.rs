@@ -278,7 +278,8 @@ fn render(v: &serde_json::Value, verbose: bool) -> String {
     if v["fec"].as_u64().unwrap_or(0) > 0 {
         let _ = writeln!(
             out,
-            "  FEC{} XOR(4+1) / 5 ms：校验发送 {}  收到 {}  恢复 {}  未恢复过期组 {}  校验队列丢弃 {}",
+            "  FEC 4+{} / 每份 {} 副本 / 5 ms：校验发送 {}  收到 {}  恢复 {}  未恢复过期组 {}  校验队列丢弃 {}",
+            v["fec_repair_shards"].as_u64().unwrap_or(1),
             count(&v["fec"]),
             count(&c["fec_tx_packets"]),
             count(&c["fec_rx_packets"]),
