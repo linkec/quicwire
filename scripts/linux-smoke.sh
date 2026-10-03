@@ -100,6 +100,11 @@ if [[ "${QUICWIRE_TEST_LIFECYCLE:-false}" == true ]]; then
   python3 "$script_dir/lifecycle-check.py" "$binary" "$server_ns" "$client_ns" "$work"
   exit 0
 fi
+# 多路径计时测试加入共同基线，避免微秒级调度抖动触发 20% 换路，
+# 与前面的备用轮转断言竞态；后续 80ms/600ms 故障注入仍在客户端。
+if [[ "${QUICWIRE_TEST_MULTIPATH:-false}" == true ]]; then
+  ip netns exec "$server_ns" tc qdisc add dev outer0 root netem delay 20ms
+fi
 start_server
 ip netns exec "$client_ns" "$binary" run --config "$work/client.toml" > "$work/client.log" 2>&1 &
 client_pid=$!
