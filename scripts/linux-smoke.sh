@@ -50,6 +50,7 @@ tun_offload = ${QUICWIRE_TEST_OFFLOAD:-true}
 EOF
 cat > "$work/client.toml" <<EOF
 mode = "client"
+selection_policy = "${QUICWIRE_TEST_SELECTION_POLICY:-balanced}"
 bind = "192.0.2.2:0"
 endpoint = "192.0.2.1:4433"
 private_key_file = "client.key"

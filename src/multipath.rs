@@ -4,6 +4,7 @@ use crate::{
     http3::{self, Session},
     identity::{Identity, PublicKey},
     packet::valid_ipv4,
+    selection::{Candidate, SelectionPolicy},
     transport,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -134,8 +135,16 @@ impl Path {
                 .seen
                 .is_some_and(|t| now.duration_since(t) < DEAD_AFTER)
     }
-    fn score(&self) -> f64 {
-        self.rtt + 4.0 * self.jitter + 100.0 * self.recent_loss
+    fn candidate(&self) -> Candidate {
+        Candidate {
+            id: self.id,
+            rtt_ms: self.rtt,
+            jitter_ms: self.jitter,
+            probe_loss: self.recent_loss,
+        }
+    }
+    fn score(&self, policy: SelectionPolicy) -> f64 {
+        policy.score(self.rtt, self.jitter, self.recent_loss)
     }
 }
 struct State {
@@ -199,6 +208,7 @@ pub struct PathStatus {
     pub score: f64,
     pub slot: Option<usize>,
     pub reserved: bool,
+    pub selection_role: Option<&'static str>,
     pub retiring: bool,
     pub ttl_remaining_secs: Option<u64>,
 }
@@ -232,6 +242,7 @@ pub struct Status {
     pub ttl_rotations: u64,
     pub ttl_waiting_reason: Option<String>,
     pub ttl_max_degradation_percent: Option<f64>,
+    pub selection_policy: Option<SelectionPolicy>,
 }
 
 fn tun_stat(name: &str, counter: &str) -> Option<u64> {
@@ -255,8 +266,19 @@ impl Shared {
         f(&mut self.state.lock().unwrap().counters);
     }
     pub fn snapshot(&self) -> Status {
+        let policy = self.config.selection_policy;
         let s = self.state.lock().unwrap();
         let now = Instant::now();
+        let guard = policy
+            .rank(
+                &s.paths
+                    .values()
+                    .filter(|p| s.active.contains(&p.id) && p.healthy(now))
+                    .map(Path::candidate)
+                    .collect::<Vec<_>>(),
+            )
+            .first()
+            .map(|p| p.id);
         let paths: Vec<_> = s
             .paths
             .values()
@@ -295,9 +317,25 @@ impl Shared {
                     rx_copies: p.rx_copies,
                     rx_bytes: p.rx_bytes,
                     queue_drops: p.queue_drops,
-                    score: p.score(),
+                    score: p.score(policy),
                     slot: (self.config.mode == Mode::Client).then_some(p.slot),
                     reserved: s.reserved.contains(&p.id),
+                    selection_role: (self.config.mode == Mode::Client
+                        && (s.active.contains(&p.id) || s.reserved.contains(&p.id)))
+                    .then(|| match policy {
+                        SelectionPolicy::Balanced => "balanced",
+                        SelectionPolicy::LowLatency => "latency",
+                        SelectionPolicy::LowLoss => "loss_guard",
+                        SelectionPolicy::Hybrid => {
+                            if (s.active.contains(&p.id) && guard == Some(p.id))
+                                || (s.reserved.contains(&p.id) && s.reserved.first() == Some(&p.id))
+                            {
+                                "loss_guard"
+                            } else {
+                                "latency"
+                            }
+                        }
+                    }),
                     retiring: s.retiring == Some(p.id),
                     ttl_remaining_secs: (self.config.mode == Mode::Client
                         && self.config.stable_session_ttl_secs != 0
@@ -345,6 +383,7 @@ impl Shared {
             tun_rx_dropped: tun_stat(&self.config.tun_name, "rx_dropped"),
             counters: s.counters.clone(),
             paths,
+            selection_policy: (self.config.mode == Mode::Client).then_some(policy),
             switch_threshold_percent: (self.config.mode == Mode::Client)
                 .then_some(self.config.switch_threshold_percent),
             stable_session_ttl_secs: (self.config.mode == Mode::Client)
@@ -388,17 +427,22 @@ impl Shared {
         }
     }
     fn tick(&self) {
+        let policy = self.config.selection_policy;
         let now = Instant::now();
         let mut s = self.state.lock().unwrap();
         let ttl = Duration::from_secs(self.config.stable_session_ttl_secs);
         if self.config.mode == Mode::Client {
-            let mut candidates: Vec<_> = s
+            let measured: Vec<_> = s
                 .paths
                 .values()
                 .filter(|p| p.healthy(now) && !p.rotating)
-                .map(|p| (p.id, p.score()))
+                .map(Path::candidate)
                 .collect();
-            candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            let candidates: Vec<_> = policy
+                .rank(&measured)
+                .iter()
+                .map(|p| (p.id, policy.score(p.rtt_ms, p.jitter_ms, p.probe_loss)))
+                .collect();
             let valid: Vec<_> = s
                 .active
                 .iter()
@@ -459,7 +503,7 @@ impl Shared {
                     && s.retiring.is_none()
                     && now.duration_since(s.last_switch) >= Duration::from_secs(5)
                 {
-                    let old_score: f64 = next.iter().map(|id| s.paths[id].score()).sum();
+                    let old_scores = group_scores(&s, &next, policy);
                     let qualifies = |ids: &[u64]| {
                         ids.len() == s.configured_active
                             && ids.iter().all(|id| {
@@ -467,9 +511,9 @@ impl Shared {
                                     .get(id)
                                     .is_some_and(|p| p.healthy(now) && !p.rotating)
                             })
-                            && score_improves(
-                                old_score,
-                                ids.iter().map(|id| s.paths[id].score()).sum(),
+                            && policy.improves(
+                                &old_scores,
+                                &group_scores(&s, ids, policy),
                                 self.config.switch_threshold_percent,
                             )
                     };
@@ -500,35 +544,57 @@ impl Shared {
                         .collect();
                     expired.sort_by_key(|id| s.paths[id].connected);
                     if !expired.is_empty() {
-                        let replacement = candidates.iter().find(|(id, _)| {
-                            !next.contains(id)
-                                && now.duration_since(s.paths[id].connected)
-                                    >= Duration::from_secs(3)
-                        });
-                        match replacement {
-                            Some((new, score)) => {
-                                if let Some(old) = expired.into_iter().find(|id| {
-                                    ttl_replacement_acceptable(
-                                        s.paths[id].score(),
-                                        *score,
-                                        self.config.ttl_max_degradation_percent,
-                                    )
-                                }) {
-                                    let pos = next.iter().position(|id| *id == old).unwrap();
-                                    next[pos] = *new;
-                                    s.retiring = Some(old);
-                                    reason = "TTL 到期，备用质量在容忍范围内，接替轮换";
-                                } else {
-                                    s.ttl_waiting_reason = Some(
-                                        "TTL 到期，最佳健康备用劣化超过容忍上限，继续使用并定期复查".into(),
-                                    );
-                                }
+                        let replacements: Vec<_> = candidates
+                            .iter()
+                            .map(|p| p.0)
+                            .filter(|id| {
+                                !next.contains(id)
+                                    && now.duration_since(s.paths[id].connected)
+                                        >= Duration::from_secs(3)
+                            })
+                            .collect();
+                        let mut handover = None;
+                        for old in expired {
+                            let mut eligible: Vec<_> = replacements
+                                .iter()
+                                .filter_map(|new| {
+                                    let mut trial = next.clone();
+                                    let pos = trial.iter().position(|id| *id == old).unwrap();
+                                    trial[pos] = *new;
+                                    let acceptable = if policy == SelectionPolicy::Hybrid {
+                                        policy.ttl_allows(
+                                            &path_candidates(&s, &next),
+                                            &path_candidates(&s, &trial),
+                                            self.config.ttl_max_degradation_percent,
+                                        )
+                                    } else {
+                                        ttl_replacement_acceptable(
+                                            s.paths[&old].score(policy),
+                                            s.paths[new].score(policy),
+                                            self.config.ttl_max_degradation_percent,
+                                        )
+                                    };
+                                    acceptable
+                                        .then(|| (trial.clone(), group_scores(&s, &trial, policy)))
+                                })
+                                .collect();
+                            eligible.sort_by(|a, b| compare_scores(&a.1, &b.1));
+                            if let Some((trial, _)) = eligible.into_iter().next() {
+                                handover = Some((old, trial));
+                                break;
                             }
-                            None => {
-                                s.ttl_waiting_reason = Some(
-                                    "TTL 到期，缺少经过至少 3 秒观察的健康备用，延后轮换".into(),
-                                )
-                            }
+                        }
+                        if let Some((old, trial)) = handover {
+                            next = trial;
+                            s.retiring = Some(old);
+                            reason = "TTL 到期，备用质量在容忍范围内，接替轮换";
+                        } else if replacements.is_empty() {
+                            s.ttl_waiting_reason =
+                                Some("TTL 到期，缺少经过至少 3 秒观察的健康备用，延后轮换".into());
+                        } else {
+                            s.ttl_waiting_reason = Some(
+                                "TTL 到期，最佳健康备用劣化超过容忍上限，继续使用并定期复查".into(),
+                            );
                         }
                     }
                 }
@@ -572,15 +638,19 @@ impl Shared {
                     }
                 }
             }
-            s.reserved = candidates
-                .iter()
-                .filter(|(id, _)| {
-                    !s.active.contains(id)
-                        && s.retiring != Some(*id)
-                        && s.paths.get(id).is_some_and(|p| !p.rotating)
+            let standby: Vec<_> = measured
+                .into_iter()
+                .filter(|p| {
+                    !s.active.contains(&p.id)
+                        && s.retiring != Some(p.id)
+                        && s.paths.get(&p.id).is_some_and(|p| !p.rotating)
                 })
+                .collect();
+            s.reserved = policy
+                .rank(&standby)
+                .iter()
                 .take(self.config.reserve_sessions)
-                .map(|p| p.0)
+                .map(|p| p.id)
                 .collect();
         }
         let active = s.active.clone();
@@ -614,6 +684,13 @@ impl Shared {
                 .filter_map(|p| {
                     if s.reserved.contains(&p.id) {
                         // 预留候选跨越普通备用周期；TTL 到期后有质量在容忍范围内的备用才重采样。
+                        let reserve_policy = if policy == SelectionPolicy::Hybrid
+                            && s.reserved.first() != Some(&p.id)
+                        {
+                            SelectionPolicy::LowLatency
+                        } else {
+                            policy
+                        };
                         let best_other = s
                             .paths
                             .values()
@@ -624,13 +701,13 @@ impl Shared {
                                     && now.duration_since(other.connected) >= Duration::from_secs(3)
                                     && !other.rotating
                             })
-                            .map(Path::score)
+                            .map(|p| p.score(reserve_policy))
                             .min_by(f64::total_cmp);
                         (!ttl.is_zero()
                             && now.duration_since(p.connected) >= ttl
                             && best_other.is_some_and(|score| {
                                 ttl_replacement_acceptable(
-                                    p.score(),
+                                    p.score(reserve_policy),
                                     score,
                                     self.config.ttl_max_degradation_percent,
                                 )
@@ -662,9 +739,20 @@ impl Shared {
     }
 }
 
-fn score_improves(current: f64, candidate: f64, threshold: f64) -> bool {
-    candidate < current * (1.0 - threshold / 100.0)
+fn path_candidates(s: &State, ids: &[u64]) -> Vec<Candidate> {
+    ids.iter().map(|id| s.paths[id].candidate()).collect()
 }
+fn group_scores(s: &State, ids: &[u64], policy: SelectionPolicy) -> Vec<f64> {
+    policy.group_scores(&path_candidates(s, ids))
+}
+fn compare_scores(a: &[f64], b: &[f64]) -> std::cmp::Ordering {
+    a.iter()
+        .zip(b)
+        .map(|(a, b)| a.total_cmp(b))
+        .find(|c| !c.is_eq())
+        .unwrap_or(a.len().cmp(&b.len()))
+}
+
 fn ttl_replacement_acceptable(current: f64, candidate: f64, tolerance: f64) -> bool {
     // 以待退役会话为基准，允许更好、相等，或仅在容忍范围内变差的备用。
     candidate <= current || candidate - current <= current * tolerance / 100.0
@@ -1487,12 +1575,162 @@ mod tests {
         assert_eq!(d.insert(u64::MAX - 2), Verdict::New);
         assert_eq!(d.insert(u64::MAX), Verdict::Duplicate);
     }
+    #[tokio::test]
+    async fn policy_presets_select_expected_authenticated_paths() {
+        for (policy, count, expected) in [
+            (SelectionPolicy::LowLatency, 1, vec![0]),
+            (SelectionPolicy::Balanced, 1, vec![1]),
+            (SelectionPolicy::LowLoss, 1, vec![2]),
+            (SelectionPolicy::Hybrid, 2, vec![0, 2]),
+        ] {
+            let (sid, _) = Identity::generate().unwrap();
+            let (cid, _) = Identity::generate().unwrap();
+            let port = free_ports();
+            let mut sc = config(Mode::Server, &cid.public, port);
+            sc.bind = "0.0.0.0:0".parse().unwrap();
+            sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
+            let mut cc = config(Mode::Client, &sid.public, port);
+            cc.endpoints = sc.listen.clone();
+            cc.max_sessions = 3;
+            cc.active_sessions = count;
+            cc.selection_policy = policy;
+            cc.stable_session_ttl_secs = 0;
+            cc.standby_rotate_secs = 0;
+            cc.switch_threshold_percent = 5.0;
+            let mut server = Multipath::start(sc, sid).unwrap();
+            let mut client = Multipath::start(cc, cid).unwrap();
+            until(|| {
+                client.shared.snapshot().healthy == 3 && server.shared.snapshot().active == count
+            })
+            .await;
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                s.last_switch = Instant::now() - Duration::from_secs(6);
+                for p in s.paths.values_mut() {
+                    let metrics = [(20.0, 10.0, 0.02), (35.0, 1.0, 0.01), (55.0, 1.0, 0.0)][p.slot];
+                    p.rtt = metrics.0;
+                    p.jitter = metrics.1;
+                    p.recent_loss = metrics.2;
+                    p.seen = Some(Instant::now());
+                }
+            }
+            client.shared.tick();
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                if let Some((_, since)) = &mut s.challenger {
+                    *since = Instant::now() - Duration::from_secs(4);
+                }
+            }
+            client.shared.tick();
+            let snapshot = client.shared.snapshot();
+            let mut actual: Vec<_> = snapshot
+                .paths
+                .iter()
+                .filter(|p| p.state == "active")
+                .map(|p| p.slot.unwrap())
+                .collect();
+            actual.sort();
+            assert_eq!(actual, expected, "策略 {policy:?}");
+            assert_eq!(snapshot.selection_policy, Some(policy));
+            if policy == SelectionPolicy::Hybrid {
+                assert_eq!(
+                    snapshot
+                        .paths
+                        .iter()
+                        .find(|p| p.slot == Some(2))
+                        .unwrap()
+                        .selection_role,
+                    Some("loss_guard")
+                );
+                assert_eq!(
+                    snapshot
+                        .paths
+                        .iter()
+                        .find(|p| p.slot == Some(0))
+                        .unwrap()
+                        .selection_role,
+                    Some("latency")
+                );
+            }
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn hybrid_ttl_keeps_loss_guard_and_rotates_acceptable_latency_path() {
+        let (sid, _) = Identity::generate().unwrap();
+        let (cid, _) = Identity::generate().unwrap();
+        let port = free_ports();
+        let mut sc = config(Mode::Server, &cid.public, port);
+        sc.bind = "0.0.0.0:0".parse().unwrap();
+        sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
+        let mut cc = config(Mode::Client, &sid.public, port);
+        cc.endpoints = sc.listen.clone();
+        cc.max_sessions = 3;
+        cc.active_sessions = 2;
+        cc.selection_policy = SelectionPolicy::Hybrid;
+        cc.stable_session_ttl_secs = 5;
+        let mut server = Multipath::start(sc, sid).unwrap();
+        let mut client = Multipath::start(cc, cid).unwrap();
+        until(|| client.shared.snapshot().healthy == 3 && server.shared.snapshot().active == 2)
+            .await;
+        let (guard, old_fast, new_fast, old_port) = {
+            let mut s = client.shared.state.lock().unwrap();
+            let ids: Vec<_> = (0..3)
+                .map(|slot| s.paths.values().find(|p| p.slot == slot).unwrap().id)
+                .collect();
+            let now = Instant::now();
+            s.last_rotation = now - Duration::from_secs(3);
+            // 保障路径先到期，替掉它会显著增加丢包评分；应跳过它再检查低延迟路径。
+            for p in s.paths.values_mut() {
+                let (r, j, l) = [(55.0, 1.0, 0.0), (20.0, 10.0, 0.02), (21.0, 10.0, 0.02)][p.slot];
+                p.rtt = r;
+                p.jitter = j;
+                p.recent_loss = l;
+                p.seen = Some(now);
+                p.connected = now - Duration::from_secs(if p.slot == 0 { 7 } else { 6 });
+            }
+            (ids[0], ids[1], ids[2], s.paths[&ids[1]].local.port())
+        };
+        client.shared.tick();
+        {
+            let s = client.shared.state.lock().unwrap();
+            assert!(
+                s.active.contains(&guard),
+                "TTL不能用高探测丢包备用替掉保障路径"
+            );
+            assert!(s.active.contains(&new_fast));
+            assert_eq!(s.retiring, Some(old_fast));
+            assert!(s.paths[&old_fast].connection.close_reason().is_none());
+        }
+        until(|| {
+            let s = client.shared.state.lock().unwrap();
+            s.ttl_rotations >= 1
+                && !s.paths.contains_key(&old_fast)
+                && s.paths
+                    .values()
+                    .any(|p| p.slot == 1 && p.healthy(Instant::now()))
+        })
+        .await;
+        let snapshot = client.shared.snapshot();
+        assert_ne!(
+            snapshot
+                .paths
+                .iter()
+                .find(|p| p.slot == Some(1))
+                .unwrap()
+                .local
+                .port(),
+            old_port
+        );
+        assert_eq!(server.shared.snapshot().active, 2);
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+
     #[test]
     fn configurable_score_and_ttl_threshold_boundaries() {
-        assert!(!score_improves(145.0, 135.0, 20.0));
-        assert!(score_improves(145.0, 135.0, 5.0));
-        assert!(!score_improves(100.0, 95.0, 5.0));
-        assert!(!score_improves(100.0, 100.0, 0.0));
         assert!(ttl_replacement_acceptable(100.0, 95.0, 10.0));
         assert!(ttl_replacement_acceptable(100.0, 100.0, 10.0));
         assert!(ttl_replacement_acceptable(100.0, 105.0, 10.0));

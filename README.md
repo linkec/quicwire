@@ -30,9 +30,9 @@ sudo quicwire run --config quicwire.toml
 
 基础版只传输两端主机的隧道地址流量，内层 MTU 默认 1100；不配置默认路由、NAT 或第三方子网转发。公钥配置方式借鉴 WireGuard，使用 Ed25519 + TLS 1.3 公钥固定验证（X.509 容器），协议与密钥格式均独立。
 
-当前版本 0.3.2：ALPN 为 `h3`，使用真实 HTTP/3 Extended CONNECT 与 HTTP Datagrams，私有 `:protocol=quicwire` 帧提供跨连接序号、探测和激活集合控制。原有公私钥与单连接配置仍可使用，但两端程序必须同时升级，不能与 0.2.x 混用。可选 `server_name` 配置 SNI。详见 [多路径配置与监控](docs/multipath.md) 和 [HTTP/3 协议与外观边界](docs/http3.md)。
+当前版本 0.3.3：ALPN 为 `h3`，使用真实 HTTP/3 Extended CONNECT 与 HTTP Datagrams，私有 `:protocol=quicwire` 帧提供跨连接序号、探测和激活集合控制。原有公私钥与单连接配置仍可使用，但两端程序必须同时升级，不能与 0.2.x 混用。可选 `server_name` 配置 SNI。详见 [多路径配置与监控](docs/multipath.md) 和 [HTTP/3 协议与外观边界](docs/http3.md)。
 
-客户端 `endpoints` 支持多个 IP/端口范围；`max_sessions=8` 维持 8 条连接，`active_sessions=2` 双向发送两份副本并去重，其余连接持续探测。`standby_rotate_secs=180` 使连续备用三分钟的连接更换 UDP 源端口重新采样。服务端 `listen=["0.0.0.0:4433-4440"]` 提供多个入口。启动按配置顺序激活前 K 条，`switch_threshold_percent` 配置评分切换门槛。`stable_session_ttl_secs=300` 与 `ttl_max_degradation_percent=10` 使稳定会话到期后允许评分最多差 10% 的健康备用接替；即使当前会话最好也轮换，备用差太多或缺失则延期。`reserve_sessions=1` 保留最佳备用，接替经服务端确认后才关闭旧会话。
+客户端 `endpoints` 支持多个 IP/端口范围；`max_sessions=8` 维持 8 条连接，`active_sessions=2` 双向发送两份副本并去重，其余连接持续探测。`standby_rotate_secs=180` 使连续备用三分钟的连接更换 UDP 源端口重新采样。服务端 `listen=["0.0.0.0:4433-4440"]` 提供多个入口。`selection_policy` 提供 `balanced`、`low_latency`、`low_loss`、`hybrid` 四种预设，混合模式使用低丢包保障路径加低延迟副本。启动按配置顺序激活前 K 条，`switch_threshold_percent` 配置评分切换门槛。`stable_session_ttl_secs=300` 与 `ttl_max_degradation_percent=10` 使稳定会话到期后允许评分最多差 10% 的健康备用接替；即使当前会话最好也轮换，备用差太多或缺失则延期。`reserve_sessions=1` 保留最佳备用，接替经服务端确认后才关闭旧会话。
 
 ```sh
 sudo quicwire status --config /etc/quicwire/quicwire.toml

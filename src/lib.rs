@@ -3,6 +3,7 @@
 pub mod config;
 pub mod identity;
 pub mod packet;
+pub mod selection;
 pub mod transport;
 
 #[cfg(target_os = "linux")]

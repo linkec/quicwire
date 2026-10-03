@@ -98,7 +98,8 @@ pub async fn read(path: &Path, json: bool) -> Result<()> {
     );
     if value["mode"] == "client" {
         println!(
-            "策略：评分改善阈值 {}%，稳定 TTL {} 秒，TTL 最大容忍劣化 {}%，预留 {}/{}，TTL 轮转 {} 次，启动待选 {}",
+            "策略：{}，评分改善阈值 {}%，稳定 TTL {} 秒，TTL 最大容忍劣化 {}%，预留 {}/{}，TTL 轮转 {} 次，启动待选 {}",
+            value["selection_policy"].as_str().unwrap_or("balanced"),
             value["switch_threshold_percent"],
             value["stable_session_ttl_secs"],
             value["ttl_max_degradation_percent"],
@@ -112,12 +113,12 @@ pub async fn read(path: &Path, json: bool) -> Result<()> {
         }
     }
     println!(
-        "路径ID           状态       本地绑定 → 对端                            RTT(ms)  抖动(ms)  探测超时/次数  备用秒  评分/角色/TTL剩余秒"
+        "路径ID           状态       本地绑定 → 对端                            RTT(ms)  抖动(ms)  探测超时/次数  备用秒  评分/轮转角色/选路角色/TTL剩余秒"
     );
     if let Some(paths) = value["paths"].as_array() {
         for p in paths {
             println!(
-                "{} {:<10} {} → {}  {:.2}  {:.2}  {}/{}  {}  {:.2}/{}/{}",
+                "{} {:<10} {} → {}  {:.2}  {:.2}  {}/{}  {}  {:.2}/{}/{}/{}",
                 p["id"].as_str().unwrap_or(""),
                 p["state"].as_str().unwrap_or(""),
                 p["local"].as_str().unwrap_or(""),
@@ -135,6 +136,7 @@ pub async fn read(path: &Path, json: bool) -> Result<()> {
                 } else {
                     "普通"
                 },
+                p["selection_role"].as_str().unwrap_or("-"),
                 p["ttl_remaining_secs"]
                     .as_u64()
                     .map(|s| s.to_string())

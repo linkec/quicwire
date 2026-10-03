@@ -1,4 +1,4 @@
-use crate::identity::PublicKey;
+use crate::{identity::PublicKey, selection::SelectionPolicy};
 use anyhow::{Context, Result, ensure};
 use ipnet::Ipv4Net;
 use serde::Deserialize;
@@ -32,6 +32,8 @@ pub struct Config {
     pub standby_rotate_secs: u64,
     #[serde(default = "default_switch_threshold")]
     pub switch_threshold_percent: f64,
+    #[serde(default)]
+    pub selection_policy: SelectionPolicy,
     #[serde(default = "default_stable_ttl")]
     pub stable_session_ttl_secs: u64,
     #[serde(default = "one")]
@@ -206,6 +208,10 @@ impl Config {
                 ensure!(
                     self.ttl_max_degradation_percent == default_ttl_max_degradation(),
                     "TTL 最大容忍劣化仅在客户端配置"
+                );
+                ensure!(
+                    self.selection_policy == SelectionPolicy::Balanced,
+                    "selection_policy 仅在客户端配置"
                 );
                 self.listen_addresses()?;
             }

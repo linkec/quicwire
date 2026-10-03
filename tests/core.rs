@@ -19,6 +19,7 @@ fn config(mode: Mode, peer: &PublicKey) -> Config {
         active_sessions: 1,
         standby_rotate_secs: 0,
         switch_threshold_percent: 20.0,
+        selection_policy: Default::default(),
         stable_session_ttl_secs: 300,
         reserve_sessions: 1,
         ttl_max_degradation_percent: 10.0,
