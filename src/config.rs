@@ -26,6 +26,8 @@ pub enum EndpointSpec {
 pub struct EndpointOptions {
     pub address: String,
     pub exclusive_group: Option<String>,
+    #[serde(default)]
+    pub backup: bool,
 }
 impl From<String> for EndpointSpec {
     fn from(value: String) -> Self {
@@ -41,6 +43,7 @@ impl From<&str> for EndpointSpec {
 pub struct RemoteTarget {
     pub address: SocketAddr,
     pub exclusive_group: Option<String>,
+    pub backup: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -85,6 +88,9 @@ pub struct Config {
     /// 0 关闭，1–3 为每组 XOR 校验的发送份数；两端必须一致。
     #[serde(default)]
     pub fec: u8,
+    /// 客户端允许手动备用在所有主线路不可用时接管原始数据。
+    #[serde(default)]
+    pub fec_backup_failover: bool,
 }
 
 fn default_bind() -> SocketAddr {
@@ -149,6 +155,10 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         PublicKey::parse(&self.peer_public_key)?;
+        ensure!(
+            !self.fec_backup_failover || (self.mode == Mode::Client && self.fec > 0),
+            "fec_backup_failover 仅用于启用 FEC 的客户端"
+        );
         ensure!(
             self.fec <= 3,
             "fec 必须为 0–3：0 关闭，1–3 为每组校验副本数"
@@ -266,6 +276,14 @@ impl Config {
                     "启用备用轮转时 bind 必须使用端口 0，以更换五元组"
                 );
                 let slots = self.client_slots()?;
+                ensure!(
+                    self.fec > 0 || slots.iter().all(|v| !v[0].backup),
+                    "endpoint backup 仅用于 FEC 模式"
+                );
+                ensure!(
+                    slots.iter().any(|v| !v[0].backup),
+                    "必须至少配置一个非 backup 的主线路端点"
+                );
                 if slots.iter().any(|v| v[0].exclusive_group.is_some()) {
                     let mut groups = std::collections::BTreeSet::new();
                     let capacity = slots
@@ -315,15 +333,16 @@ impl Config {
             return Ok(vec![RemoteTarget {
                 address,
                 exclusive_group: None,
+                backup: false,
             }]);
         }
         let mut targets = std::collections::BTreeMap::new();
         // 保留显式组的配置顺序；无分组旧配置仍按 IP 交错。
         let mut group_order = Vec::new();
         for spec in &self.endpoints {
-            let (address, group) = match spec {
-                EndpointSpec::Address(a) => (a, None),
-                EndpointSpec::Options(o) => (&o.address, o.exclusive_group.clone()),
+            let (address, group, backup) = match spec {
+                EndpointSpec::Address(a) => (a, None, false),
+                EndpointSpec::Options(o) => (&o.address, o.exclusive_group.clone(), o.backup),
             };
             if let Some(name) = &group {
                 ensure!(
@@ -341,11 +360,11 @@ impl Config {
             for address in expand_addresses(std::slice::from_ref(address))? {
                 if let Some(existing) = targets.get(&address) {
                     ensure!(
-                        existing == &group,
-                        "同一端点不能配置冲突的 exclusive_group：{address}"
+                        existing == &(group.clone(), backup),
+                        "同一端点不能配置冲突的 exclusive_group 或 backup：{address}"
                     );
                 } else {
-                    targets.insert(address, group.clone());
+                    targets.insert(address, (group.clone(), backup));
                 }
             }
             ensure!(targets.len() <= 256, "地址展开后超过 256 个");
@@ -353,7 +372,7 @@ impl Config {
         ensure!(!targets.is_empty(), "client 必须设置 endpoint 或 endpoints");
         let mut buckets: std::collections::BTreeMap<_, std::collections::VecDeque<_>> =
             std::collections::BTreeMap::new();
-        for (address, exclusive_group) in targets {
+        for (address, (exclusive_group, backup)) in targets {
             let key = match &exclusive_group {
                 Some(g) => (
                     0,
@@ -368,10 +387,14 @@ impl Config {
             } else {
                 key
             };
-            buckets.entry(key).or_default().push_back(RemoteTarget {
-                address,
-                exclusive_group,
-            });
+            buckets
+                .entry((key, backup))
+                .or_default()
+                .push_back(RemoteTarget {
+                    address,
+                    exclusive_group,
+                    backup,
+                });
         }
         let mut result = Vec::new();
         while !buckets.is_empty() {
@@ -395,7 +418,10 @@ impl Config {
     pub fn client_slots(&self) -> Result<Vec<Vec<RemoteTarget>>> {
         let targets = self.remote_targets()?;
         let count = self.max_sessions.min(targets.len());
-        if !targets.iter().any(|t| t.exclusive_group.is_some()) {
+        if !targets
+            .iter()
+            .any(|t| t.exclusive_group.is_some() || t.backup)
+        {
             return Ok((0..count)
                 .map(|slot| targets.iter().skip(slot).step_by(count).cloned().collect())
                 .collect());
@@ -411,20 +437,28 @@ impl Config {
             let slots: Vec<_> = result
                 .iter()
                 .enumerate()
-                .filter(|(_, v)| v[0].exclusive_group == target.exclusive_group)
+                .filter(|(_, v)| {
+                    v[0].exclusive_group == target.exclusive_group && v[0].backup == target.backup
+                })
                 .map(|(i, _)| i)
                 .collect();
             ensure!(
                 !slots.is_empty(),
-                "max_sessions 不足以为每个互斥组（及未分组入口）分配候选槽位"
+                "max_sessions 不足以为每个互斥组与主备角色组合（及未分组入口）分配候选槽位"
             );
             let next = cursor
-                .entry(target.exclusive_group.clone())
+                .entry((target.exclusive_group.clone(), target.backup))
                 .or_insert(0usize);
             result[slots[*next % slots.len()]].push(target);
             *next += 1;
         }
         Ok(result)
+    }
+    pub fn endpoint_backup(&self, address: SocketAddr) -> bool {
+        self.remote_targets()
+            .unwrap_or_default()
+            .iter()
+            .any(|t| t.address == address && t.backup)
     }
     pub fn exclusive_group(&self, address: SocketAddr) -> Option<String> {
         self.remote_targets()

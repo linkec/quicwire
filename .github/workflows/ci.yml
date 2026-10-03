@@ -54,3 +54,5 @@ jobs:
           path: target/release/quicwire
           if-no-files-found: error
           retention-days: 14
+      - name: FEC 主备与故障接管开关
+        run: sudo env QUICWIRE_TEST_FEC=2 QUICWIRE_TEST_FEC_ROLES=true QUICWIRE_TEST_SELECTION_POLICY=hybrid bash scripts/linux-smoke.sh target/release/quicwire

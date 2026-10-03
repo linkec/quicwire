@@ -129,7 +129,9 @@ fn headers(config: &Config, multipath: bool) -> HeaderMap {
     if config.fec > 0 {
         h.insert(
             "x-tunnel-fec",
-            format!("xor4-v1-{}", config.fec).parse().unwrap(),
+            format!("xor4-v2-primary-backup-{}", config.fec)
+                .parse()
+                .unwrap(),
         );
     }
     h
@@ -149,7 +151,7 @@ fn check_headers(h: &HeaderMap, config: &Config, multipath: bool) -> Result<()> 
         if config.fec > 0 {
             h.get_all("x-tunnel-fec").iter().count() == 1
                 && h.get("x-tunnel-fec")
-                    .is_some_and(|v| v == format!("xor4-v1-{}", config.fec).as_str())
+                    .is_some_and(|v| v == format!("xor4-v2-primary-backup-{}", config.fec).as_str())
         } else {
             !h.contains_key("x-tunnel-fec")
         },

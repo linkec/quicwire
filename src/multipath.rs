@@ -85,6 +85,7 @@ impl Dedup {
 #[derive(Clone)]
 pub struct PathSender {
     pub id: u64,
+    pub primary: bool,
     pub sender: mpsc::Sender<Bytes>,
 }
 #[derive(Default, Serialize, Clone)]
@@ -119,6 +120,7 @@ struct Path {
     local: SocketAddr,
     remote: SocketAddr,
     exclusive_group: Option<String>,
+    backup: bool,
     connection: Connection,
     sender: mpsc::Sender<Bytes>,
     connected: Instant,
@@ -142,6 +144,8 @@ struct Path {
     rx_effective_bytes: u64,
     rx_duplicates: u64,
     queue_drops: u64,
+    fec_tx_packets: u64,
+    fec_tx_bytes: u64,
 }
 impl Path {
     fn healthy(&self, now: Instant) -> bool {
@@ -163,6 +167,8 @@ impl Path {
     }
 }
 struct State {
+    fec: bool,
+    fec_backup_failover: bool,
     client_epoch: Option<Epoch>,
     server_epoch: Option<Epoch>,
     retired: VecDeque<(Epoch, Instant)>,
@@ -203,6 +209,7 @@ pub struct PathStatus {
     pub local: SocketAddr,
     pub remote: SocketAddr,
     pub exclusive_group: Option<String>,
+    pub endpoint_backup: Option<bool>,
     pub state: &'static str,
     pub tx_bps: f64,
     pub rx_bps: f64,
@@ -225,6 +232,8 @@ pub struct PathStatus {
     pub rx_effective_bytes: u64,
     pub rx_duplicates: u64,
     pub queue_drops: u64,
+    pub fec_tx_packets: u64,
+    pub fec_tx_bytes: u64,
     pub score: f64,
     pub slot: Option<usize>,
     pub reserved: bool,
@@ -234,6 +243,9 @@ pub struct PathStatus {
 }
 #[derive(Serialize)]
 pub struct Status {
+    pub fec_primary: Option<String>,
+    pub fec_backup_failover: Option<bool>,
+    pub fec_failover_active: Option<bool>,
     pub fec: u8,
     pub fec_expired_groups: u64,
     pub fec_evictions: u64,
@@ -312,6 +324,7 @@ impl Shared {
                     local: p.local,
                     remote: p.remote,
                     exclusive_group: p.exclusive_group.clone(),
+                    endpoint_backup: (self.config.mode == Mode::Client).then_some(p.backup),
                     state: if !p.healthy(now) {
                         if p.seen.is_none() {
                             "probing"
@@ -344,25 +357,38 @@ impl Shared {
                     rx_copies: p.rx_copies,
                     rx_bytes: p.rx_bytes,
                     queue_drops: p.queue_drops,
+                    fec_tx_packets: p.fec_tx_packets,
+                    fec_tx_bytes: p.fec_tx_bytes,
                     score: p.score(policy),
                     slot: (self.config.mode == Mode::Client).then_some(p.slot),
                     reserved: s.reserved.contains(&p.id),
-                    selection_role: (self.config.mode == Mode::Client
-                        && (s.active.contains(&p.id) || s.reserved.contains(&p.id)))
-                    .then(|| match policy {
-                        SelectionPolicy::Balanced => "balanced",
-                        SelectionPolicy::LowLatency => "latency",
-                        SelectionPolicy::LowLoss => "loss_guard",
-                        SelectionPolicy::Hybrid => {
-                            if (s.active.contains(&p.id) && guard == Some(p.id))
-                                || (s.reserved.contains(&p.id) && s.reserved.first() == Some(&p.id))
-                            {
-                                "loss_guard"
+                    selection_role: if s.fec {
+                        s.active
+                            .contains(&p.id)
+                            .then_some(if s.active.first() == Some(&p.id) {
+                                "primary"
                             } else {
-                                "latency"
+                                "backup"
+                            })
+                    } else {
+                        (self.config.mode == Mode::Client
+                            && (s.active.contains(&p.id) || s.reserved.contains(&p.id)))
+                        .then(|| match policy {
+                            SelectionPolicy::Balanced => "balanced",
+                            SelectionPolicy::LowLatency => "latency",
+                            SelectionPolicy::LowLoss => "loss_guard",
+                            SelectionPolicy::Hybrid => {
+                                if (s.active.contains(&p.id) && guard == Some(p.id))
+                                    || (s.reserved.contains(&p.id)
+                                        && s.reserved.first() == Some(&p.id))
+                                {
+                                    "loss_guard"
+                                } else {
+                                    "latency"
+                                }
                             }
-                        }
-                    }),
+                        })
+                    },
                     retiring: s.retiring == Some(p.id),
                     ttl_remaining_secs: (self.config.mode == Mode::Client
                         && self.config.stable_session_ttl_secs != 0
@@ -381,6 +407,17 @@ impl Shared {
             .count();
         let active = paths.iter().filter(|p| p.state == "active").count();
         Status {
+            fec_primary: s
+                .fec
+                .then(|| s.active.first().map(|id| format!("{id:016x}")))
+                .flatten(),
+            fec_backup_failover: (self.config.mode == Mode::Client && s.fec)
+                .then_some(self.config.fec_backup_failover),
+            fec_failover_active: (s.fec && self.config.mode == Mode::Client).then(|| {
+                s.active
+                    .first()
+                    .is_some_and(|id| s.paths.get(id).is_some_and(|p| p.backup))
+            }),
             fec: self.config.fec,
             fec_expired_groups: s.fec_decoder.expired_missing,
             fec_evictions: s.fec_decoder.evictions,
@@ -394,7 +431,11 @@ impl Shared {
             active,
             degraded: active < s.configured_active || paths.len() < s.configured_max,
             reason: if active == 0 {
-                "没有可用激活连接".into()
+                if s.fec && self.config.mode == Mode::Client && !self.config.fec_backup_failover {
+                    "没有健康主线路，备用接管已关闭".into()
+                } else {
+                    "没有可用激活连接".into()
+                }
             } else if active < s.configured_active {
                 if self.config.mode == Mode::Client
                     && paths.iter().any(|p| p.exclusive_group.is_some())
@@ -443,6 +484,7 @@ impl Shared {
                 .filter(|p| p.healthy(now))
                 .map(|p| PathSender {
                     id: p.id,
+                    primary: s.active.first() == Some(&p.id),
                     sender: p.sender.clone(),
                 })
                 .collect(),
@@ -521,23 +563,45 @@ impl Shared {
                 if initial_ready
                     || now.duration_since(s.selection_started) >= transport::HANDSHAKE_TIMEOUT
                 {
-                    next =
-                        distinct_paths(&s, ordered.into_iter().map(|p| p.0), s.configured_active);
+                    next = active_paths(&s, ordered.into_iter().map(|p| p.0), s.configured_active);
                     if !next.is_empty() {
                         s.startup_pending = false;
                     }
                     reason = "启动按配置顺序激活";
                 }
             } else {
-                for (id, _) in &candidates {
-                    if next.len() >= s.configured_active {
-                        break;
-                    }
-                    if can_add_path(&s, &next, *id) {
-                        next.push(*id);
-                    }
-                }
-                let best = distinct_paths(&s, candidates.iter().map(|p| p.0), s.configured_active);
+                next = active_paths(
+                    &s,
+                    next.into_iter().chain(candidates.iter().map(|p| p.0)),
+                    s.configured_active,
+                );
+                let best_order = if s.fec && policy == SelectionPolicy::Hybrid {
+                    let mut ids: Vec<_> = candidates.iter().map(|p| p.0).collect();
+                    ids.sort_by(|a, b| s.paths[a].rtt.total_cmp(&s.paths[b].rtt));
+                    // 主线路按低延迟挑选，其余校验备用按低丢包排序。
+                    let primary =
+                        ids.iter()
+                            .copied()
+                            .find(|id| !s.paths[id].backup)
+                            .or_else(|| {
+                                s.fec_backup_failover
+                                    .then(|| ids.first().copied())
+                                    .flatten()
+                            });
+                    ids.sort_by(|a, b| {
+                        (Some(*a) != primary)
+                            .cmp(&(Some(*b) != primary))
+                            .then_with(|| {
+                                s.paths[a]
+                                    .score(SelectionPolicy::LowLoss)
+                                    .total_cmp(&s.paths[b].score(SelectionPolicy::LowLoss))
+                            })
+                    });
+                    ids
+                } else {
+                    candidates.iter().map(|p| p.0).collect()
+                };
+                let best = active_paths(&s, best_order, s.configured_active);
                 if next == s.active
                     && !best.is_empty()
                     && s.retiring.is_none()
@@ -546,7 +610,7 @@ impl Shared {
                     let old_scores = group_scores(&s, &next, policy);
                     let qualifies = |ids: &[u64]| {
                         ids.len() == s.configured_active
-                            && distinct_paths(&s, ids.iter().copied(), ids.len()).len() == ids.len()
+                            && active_paths(&s, ids.iter().copied(), ids.len()) == ids
                             && ids.iter().all(|id| {
                                 s.paths
                                     .get(id)
@@ -602,12 +666,23 @@ impl Shared {
                                     let mut trial = next.clone();
                                     let pos = trial.iter().position(|id| *id == old).unwrap();
                                     trial[pos] = *new;
-                                    if distinct_paths(&s, trial.iter().copied(), trial.len()).len()
-                                        != trial.len()
+                                    if active_paths(&s, trial.iter().copied(), trial.len()) != trial
+                                        || (s.fec && s.paths[&old].backup != s.paths[new].backup)
                                     {
                                         return None;
                                     }
-                                    let acceptable = if policy == SelectionPolicy::Hybrid {
+                                    let acceptable = if s.fec {
+                                        group_scores(&s, &next, policy)
+                                            .iter()
+                                            .zip(group_scores(&s, &trial, policy))
+                                            .all(|(old, new)| {
+                                                ttl_replacement_acceptable(
+                                                    *old,
+                                                    new,
+                                                    self.config.ttl_max_degradation_percent,
+                                                )
+                                            })
+                                    } else if policy == SelectionPolicy::Hybrid {
                                         policy.ttl_allows(
                                             &path_candidates(&s, &next),
                                             &path_candidates(&s, &trial),
@@ -749,6 +824,7 @@ impl Shared {
                             .values()
                             .filter(|other| {
                                 other.id != p.id
+                                    && (!s.fec || other.backup == p.backup)
                                     && (p.exclusive_group.is_none()
                                         || other.exclusive_group == p.exclusive_group)
                                     && !active.contains(&other.id)
@@ -817,11 +893,62 @@ fn distinct_paths(s: &State, ordered: impl IntoIterator<Item = u64>, limit: usiz
     selected
 }
 
+// FEC 的 active[0] 是双方共同使用的主线路。显式备用永远不抢正常主路。
+fn active_paths(s: &State, ordered: impl IntoIterator<Item = u64>, limit: usize) -> Vec<u64> {
+    let ids: Vec<_> = ordered.into_iter().collect();
+    if !s.fec {
+        return distinct_paths(s, ids, limit);
+    }
+    let primary = ids
+        .iter()
+        .copied()
+        .find(|id| !s.paths[id].backup)
+        .or_else(|| {
+            if s.fec_backup_failover {
+                ids.first().copied()
+            } else {
+                None
+            }
+        });
+    let Some(primary) = primary else {
+        return Vec::new();
+    };
+    // 手动备用优先占用校验席位，其余普通端点也可作为自动备用。
+    distinct_paths(
+        s,
+        std::iter::once(primary)
+            .chain(
+                ids.iter()
+                    .copied()
+                    .filter(|id| *id != primary && s.paths[id].backup),
+            )
+            .chain(
+                ids.iter()
+                    .copied()
+                    .filter(|id| *id != primary && !s.paths[id].backup),
+            ),
+        limit,
+    )
+}
 fn path_candidates(s: &State, ids: &[u64]) -> Vec<Candidate> {
     ids.iter().map(|id| s.paths[id].candidate()).collect()
 }
 fn group_scores(s: &State, ids: &[u64], policy: SelectionPolicy) -> Vec<f64> {
-    policy.group_scores(&path_candidates(s, ids))
+    if s.fec && policy == SelectionPolicy::Hybrid {
+        let Some(first) = ids.first() else {
+            return Vec::new();
+        };
+        let mut backup: Vec<_> = ids[1..]
+            .iter()
+            .map(|id| s.paths[id].score(SelectionPolicy::LowLoss))
+            .collect();
+        backup.sort_by(f64::total_cmp);
+        let mut scores = vec![s.paths[first].rtt];
+        scores.extend(backup);
+        scores
+    } else {
+        policy.group_scores(&path_candidates(s, ids))
+    }
 }
 fn compare_scores(a: &[f64], b: &[f64]) -> std::cmp::Ordering {
     a.iter()
@@ -929,6 +1056,8 @@ impl Multipath {
             available: Notify::new(),
             selected,
             state: Mutex::new(State {
+                fec: config.fec > 0,
+                fec_backup_failover: config.fec_backup_failover,
                 client_epoch: (config.mode == Mode::Client).then_some(boot),
                 server_epoch: (config.mode == Mode::Server).then_some(boot),
                 retired: VecDeque::new(),
@@ -1203,6 +1332,7 @@ async fn connected(
                 } else {
                     None
                 },
+                backup: client && shared.config.endpoint_backup(conn.remote_address()),
                 connection: conn.clone(),
                 sender: tx,
                 connected: Instant::now(),
@@ -1226,6 +1356,8 @@ async fn connected(
                 rx_copies: 0,
                 rx_bytes: 0,
                 queue_drops: 0,
+                fec_tx_packets: 0,
+                fec_tx_bytes: 0,
             },
         );
     }
@@ -1291,6 +1423,9 @@ async fn send_loop(
         if let Some(p) = s.paths.get_mut(&id) {
             if data.first() != Some(&fec::REPAIR) {
                 p.tx_copies += 1;
+            } else {
+                p.fec_tx_packets += 1;
+                p.fec_tx_bytes += data.len() as u64;
             }
             p.tx_bytes += data.len() as u64;
         }
@@ -1573,11 +1708,10 @@ async fn receive_loop(
     }
 }
 
-/// FEC 发送器：原始包单发，校验走另一条激活路径；单路径降级时仍可原路校验。
+/// FEC 原始包只走控制面指定主路，校验只走激活备用；队列背压不改变角色。
 #[derive(Default)]
 pub struct FecSender {
     encoder: Encoder,
-    primary: Option<u64>,
 }
 impl FecSender {
     pub fn deadline(&self) -> Option<Instant> {
@@ -1589,25 +1723,14 @@ impl FecSender {
         selected: &watch::Receiver<Vec<PathSender>>,
         shared: &Shared,
     ) {
-        let mut paths = selected.borrow().clone();
-        let state = shared.state.lock().unwrap();
-        paths.sort_by(|a, b| {
-            (a.id == self.primary.unwrap_or(0))
-                .cmp(&(b.id == self.primary.unwrap_or(0)))
-                .then_with(|| {
-                    let score = |id| {
-                        state
-                            .paths
-                            .get(&id)
-                            .map(|p| p.score(SelectionPolicy::LowLoss))
-                            .unwrap_or(f64::MAX)
-                    };
-                    score(a.id).total_cmp(&score(b.id))
-                })
-        });
-        drop(state);
+        let paths: Vec<_> = selected
+            .borrow()
+            .iter()
+            .filter(|p| !p.primary)
+            .cloned()
+            .collect();
         // 同一份校验最多发 3 份，先分散到不同激活路径；路径不足时循环复用。
-        // 每份只成功入队一次；排队失败时尝试其它激活路径，不阻塞原始数据。
+        // 每份只成功入队一次；排队失败时尝试其它激活备用，不阻塞原始数据。
         let count = paths.len();
         for copy in 0..shared.config.fec as usize {
             let mut sent = false;
@@ -1627,7 +1750,6 @@ impl FecSender {
         if let Some(data) = self.encoder.flush() {
             self.repair(data, selected, shared);
         }
-        self.primary = None;
     }
     pub async fn send(
         &mut self,
@@ -1647,28 +1769,20 @@ impl FecSender {
             let notified = shared.available.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let mut paths = selected.borrow_and_update().clone();
+            let paths: Vec<_> = selected
+                .borrow_and_update()
+                .iter()
+                .filter(|p| p.primary)
+                .cloned()
+                .collect();
             if paths.is_empty() {
                 shared.counters(|c| c.disconnected += 1);
                 return false;
             }
-            {
-                let state = shared.state.lock().unwrap();
-                paths.sort_by(|a, b| {
-                    (Some(a.id) != self.primary)
-                        .cmp(&(Some(b.id) != self.primary))
-                        .then_with(|| {
-                            let rtt = |id| state.paths.get(&id).map(|p| p.rtt).unwrap_or(f64::MAX);
-                            rtt(a.id).total_cmp(&rtt(b.id))
-                        })
-                });
-            }
             for p in paths {
                 if p.sender.try_send(frame.clone()).is_ok() {
-                    self.primary = Some(p.id);
                     if let Some(repair) = self.encoder.push(seq, data.slice(9..), Instant::now()) {
                         self.repair(repair, selected, shared);
-                        self.primary = None;
                     }
                     return true;
                 }
@@ -2133,6 +2247,7 @@ mod tests {
         crate::config::EndpointSpec::Options(crate::config::EndpointOptions {
             address,
             exclusive_group: Some(group.into()),
+            backup: false,
         })
     }
 
@@ -2587,10 +2702,12 @@ mod tests {
         let (_tx, mut selected) = watch::channel(vec![
             PathSender {
                 id: 10,
+                primary: true,
                 sender: full,
             },
             PathSender {
                 id: 11,
+                primary: false,
                 sender: free,
             },
         ]);
@@ -2692,6 +2809,199 @@ mod tests {
                     == before.fec_tx_packets + 2 * u64::from(copies)
             })
             .await;
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
+    #[test]
+    fn fec_backup_config_preserves_roles_across_rotation_and_rejects_conflicts() {
+        let (id, _) = Identity::generate().unwrap();
+        let mut c = config(Mode::Client, &id.public, 4000);
+        c.fec = 2;
+        c.max_sessions = 2;
+        c.active_sessions = 2;
+        c.endpoints = toml::from_str::<Config>(&format!(
+            r#"
+mode = "client"
+endpoints = [{{address="127.0.0.1:4000-4003"}}, {{address="127.0.0.1:4004-4007", backup=true}}]
+private_key_file = "unused.key"
+peer_public_key = "{}"
+tun_name = "qw0"
+tun_address = "10.77.0.2/30"
+peer_address = "10.77.0.1"
+"#,
+            id.public.encode()
+        ))
+        .unwrap()
+        .endpoints;
+        c.validate().unwrap();
+        let slots = c.client_slots().unwrap();
+        assert_eq!(slots.len(), 2);
+        assert!(!slots[0][0].backup);
+        assert!(slots[1][0].backup);
+        assert!(
+            slots
+                .iter()
+                .all(|v| v.len() == 4 && v.iter().all(|t| t.backup == v[0].backup))
+        );
+        c.fec_backup_failover = true;
+        c.validate().unwrap();
+        c.fec = 0;
+        assert!(c.validate().is_err());
+        c.fec = 2;
+        c.endpoints.push("127.0.0.1:4004".into());
+        assert!(c.validate().is_err());
+        c.endpoints.pop();
+        c.endpoints.remove(0);
+        assert!(c.validate().is_err(), "即使允许接管也必须配置主线路池");
+    }
+
+    #[tokio::test]
+    async fn fec_manual_backup_roles_failover_switch_and_bidirectional_routing() {
+        for failover in [false, true] {
+            let (sid, _) = Identity::generate().unwrap();
+            let (cid, _) = Identity::generate().unwrap();
+            let port = free_ports();
+            let mut sc = config(Mode::Server, &cid.public, port);
+            sc.bind = "0.0.0.0:0".parse().unwrap();
+            sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
+            sc.fec = 2;
+            let mut cc = config(Mode::Client, &sid.public, port);
+            cc.endpoints = vec![
+                format!("127.0.0.1:{port}").into(),
+                crate::config::EndpointSpec::Options(crate::config::EndpointOptions {
+                    address: format!("127.0.0.1:{}-{}", port + 1, port + 2),
+                    exclusive_group: None,
+                    backup: true,
+                }),
+            ];
+            cc.fec = 2;
+            cc.max_sessions = 3;
+            cc.active_sessions = 3;
+            cc.fec_backup_failover = failover;
+            cc.selection_policy = SelectionPolicy::Hybrid;
+            cc.stable_session_ttl_secs = 0;
+            cc.standby_rotate_secs = 0;
+            let mut server = Multipath::start(sc, sid).unwrap();
+            let mut client = Multipath::start(cc, cid).unwrap();
+            until(|| client.shared.snapshot().active == 3 && server.shared.snapshot().active == 3)
+                .await;
+            let primary = client.shared.state.lock().unwrap().active[0];
+            assert_eq!(
+                client.shared.state.lock().unwrap().paths[&primary]
+                    .remote
+                    .port(),
+                port
+            );
+            assert_eq!(
+                client.shared.snapshot().fec_primary,
+                server.shared.snapshot().fec_primary
+            );
+            // RTT 更低的手动备用也不能在正常情况下抢占主路。
+            {
+                let mut state = client.shared.state.lock().unwrap();
+                let now = Instant::now();
+                state.last_switch = now - Duration::from_secs(10);
+                for p in state.paths.values_mut() {
+                    p.seen = Some(now);
+                    p.rtt = if p.backup { 1.0 } else { 100.0 };
+                    p.jitter = 0.0;
+                    p.recent_loss = 0.0;
+                }
+            }
+            client.shared.tick();
+            assert_eq!(client.shared.state.lock().unwrap().active[0], primary);
+            for reverse in [false, true] {
+                let (source, dest) = if reverse {
+                    (&mut server, &mut client)
+                } else {
+                    (&mut client, &mut server)
+                };
+                let mut sender = FecSender::default();
+                let mut selected = source.selected.clone();
+                for seq in 1..=8 {
+                    assert!(
+                        sender
+                            .send(packet(seq, reverse), &mut selected, &source.shared)
+                            .await
+                    );
+                }
+                for _ in 0..8 {
+                    tokio::time::timeout(Duration::from_secs(2), dest.received.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                until(|| source.shared.snapshot().counters.fec_tx_packets == 4).await;
+                let snapshot = source.shared.snapshot();
+                for p in snapshot.paths {
+                    if p.selection_role == Some("primary") {
+                        assert_eq!(p.tx_copies, 8);
+                        assert_eq!(p.fec_tx_packets, 0);
+                    } else {
+                        assert_eq!(p.tx_copies, 0);
+                        assert_eq!(p.fec_tx_packets, 2);
+                    }
+                }
+            }
+            // 已同步的主路在服务端失去健康状态时，不能静默把校验路提升为主路。
+            {
+                let mut state = server.shared.state.lock().unwrap();
+                state.paths.get_mut(&primary).unwrap().seen = None;
+                server.shared.publish(&state);
+                assert!(server.selected.borrow().iter().all(|p| !p.primary));
+                state.paths.get_mut(&primary).unwrap().seen = Some(Instant::now());
+                server.shared.publish(&state);
+            }
+            // 主队列满时不能偷发到备用队列。
+            let (full, _hold) = mpsc::channel(1);
+            full.try_send(Bytes::from_static(b"busy")).unwrap();
+            let (spare, mut spare_rx) = mpsc::channel(4);
+            let (_hold_watch, mut selected) = watch::channel(vec![
+                PathSender {
+                    id: primary,
+                    primary: true,
+                    sender: full,
+                },
+                PathSender {
+                    id: primary.wrapping_add(1),
+                    primary: false,
+                    sender: spare,
+                },
+            ]);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(50),
+                    FecSender::default().send(packet(20, false), &mut selected, &client.shared)
+                )
+                .await
+                .is_err()
+            );
+            assert!(spare_rx.try_recv().is_err());
+            // 模拟控制面观测到所有主线路失效，检查开关两种结果与恢复回切。
+            {
+                let mut state = client.shared.state.lock().unwrap();
+                state.paths.get_mut(&primary).unwrap().seen = None;
+                for p in state.paths.values_mut().filter(|p| p.backup) {
+                    p.seen = Some(Instant::now());
+                }
+            }
+            client.shared.tick();
+            if failover {
+                assert_eq!(client.shared.snapshot().active, 2);
+                assert_eq!(client.shared.snapshot().fec_failover_active, Some(true));
+            } else {
+                assert_eq!(client.shared.snapshot().active, 0);
+                assert!(client.selected.borrow().is_empty());
+            }
+            {
+                let mut state = client.shared.state.lock().unwrap();
+                state.paths.get_mut(&primary).unwrap().seen = Some(Instant::now());
+            }
+            client.shared.tick();
+            assert_eq!(client.shared.state.lock().unwrap().active[0], primary);
+            assert_eq!(client.shared.snapshot().fec_failover_active, Some(false));
             client.shutdown().await;
             server.shutdown().await;
         }

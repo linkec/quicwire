@@ -144,6 +144,8 @@ fn policy_name(value: &serde_json::Value) -> &str {
     match value.as_str() {
         Some("hybrid") => "混合",
         Some("balanced") => "综合",
+        Some("primary") => "主路",
+        Some("backup") => "校验备用",
         Some("low_latency") => "低延迟",
         Some("low_loss") => "低丢包",
         _ => text(value),
@@ -163,6 +165,8 @@ fn role_name(value: &serde_json::Value) -> &str {
         Some("latency") => "延迟",
         Some("loss_guard") => "保障",
         Some("balanced") => "综合",
+        Some("primary") => "主路",
+        Some("backup") => "校验备用",
         _ => "",
     }
 }

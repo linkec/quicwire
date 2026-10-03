@@ -82,8 +82,13 @@ standby_rotate_secs = 5
 EOF_MP
 fi
 if [[ "${QUICWIRE_TEST_FEC:-0}" != 0 ]]; then
+  sed -i 's/endpoints = \["192.0.2.1:4433-4436"\]/endpoints = [{address="192.0.2.1:4433-4434"}, {address="192.0.2.1:4435-4436", backup=true}]/' "$work/client.toml"
   echo "fec = ${QUICWIRE_TEST_FEC}" >> "$work/server.toml"
   echo "fec = ${QUICWIRE_TEST_FEC}" >> "$work/client.toml"
+fi
+if [[ "${QUICWIRE_TEST_FEC_ROLES:-false}" == true ]]; then
+  python3 "$script_dir/fec-role-check.py" "$binary" "$server_ns" "$client_ns" "$work"
+  exit 0
 fi
 if [[ "${QUICWIRE_TEST_EXCLUSIVE:-false}" == true ]]; then
   python3 "$script_dir/exclusive-check.py" "$binary" "$server_ns" "$client_ns" "$work"
