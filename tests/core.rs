@@ -21,7 +21,7 @@ fn config(mode: Mode, peer: &PublicKey) -> Config {
         switch_threshold_percent: 20.0,
         stable_session_ttl_secs: 300,
         reserve_sessions: 1,
-        ttl_degradation_percent: 10.0,
+        ttl_max_degradation_percent: 10.0,
         private_key_file: "unused.key".into(),
         peer_public_key: peer.encode(),
         tun_name: "qw0".into(),

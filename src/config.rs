@@ -36,8 +36,8 @@ pub struct Config {
     pub stable_session_ttl_secs: u64,
     #[serde(default = "one")]
     pub reserve_sessions: usize,
-    #[serde(default = "default_ttl_degradation")]
-    pub ttl_degradation_percent: f64,
+    #[serde(default = "default_ttl_max_degradation")]
+    pub ttl_max_degradation_percent: f64,
     pub endpoint: Option<SocketAddr>,
     /// 可选 DNS 名称，用于 SNI 与 HTTP authority；身份仍按 peer 公钥固定。
     pub server_name: Option<String>,
@@ -68,7 +68,7 @@ fn default_switch_threshold() -> f64 {
 fn default_stable_ttl() -> u64 {
     300
 }
-fn default_ttl_degradation() -> f64 {
+fn default_ttl_max_degradation() -> f64 {
     10.0
 }
 
@@ -127,9 +127,9 @@ impl Config {
         );
         ensure!(self.reserve_sessions <= 32, "reserve_sessions 必须为 0–32");
         ensure!(
-            self.ttl_degradation_percent.is_finite()
-                && (0.0..=1000.0).contains(&self.ttl_degradation_percent),
-            "ttl_degradation_percent 必须为 0–1000 的有限数值"
+            self.ttl_max_degradation_percent.is_finite()
+                && (0.0..=1000.0).contains(&self.ttl_max_degradation_percent),
+            "ttl_max_degradation_percent 必须为 0–1000 的有限数值"
         );
         ensure!(
             self.standby_rotate_secs == 0 || (5..=86400).contains(&self.standby_rotate_secs),
@@ -204,8 +204,8 @@ impl Config {
                     "评分阈值、稳定会话 TTL 和预留数量仅在客户端配置"
                 );
                 ensure!(
-                    self.ttl_degradation_percent == default_ttl_degradation(),
-                    "TTL 劣化门槛仅在客户端配置"
+                    self.ttl_max_degradation_percent == default_ttl_max_degradation(),
+                    "TTL 最大容忍劣化仅在客户端配置"
                 );
                 self.listen_addresses()?;
             }

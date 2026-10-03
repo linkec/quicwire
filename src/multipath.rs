@@ -231,7 +231,7 @@ pub struct Status {
     pub startup_pending: bool,
     pub ttl_rotations: u64,
     pub ttl_waiting_reason: Option<String>,
-    pub ttl_degradation_percent: Option<f64>,
+    pub ttl_max_degradation_percent: Option<f64>,
 }
 
 fn tun_stat(name: &str, counter: &str) -> Option<u64> {
@@ -355,8 +355,8 @@ impl Shared {
             startup_pending: s.startup_pending,
             ttl_rotations: s.ttl_rotations,
             ttl_waiting_reason: s.ttl_waiting_reason.clone(),
-            ttl_degradation_percent: (self.config.mode == Mode::Client)
-                .then_some(self.config.ttl_degradation_percent),
+            ttl_max_degradation_percent: (self.config.mode == Mode::Client)
+                .then_some(self.config.ttl_max_degradation_percent),
         }
     }
     fn publish(&self, s: &State) {
@@ -508,19 +508,19 @@ impl Shared {
                         match replacement {
                             Some((new, score)) => {
                                 if let Some(old) = expired.into_iter().find(|id| {
-                                    ttl_degraded(
+                                    ttl_replacement_acceptable(
                                         s.paths[id].score(),
                                         *score,
-                                        self.config.ttl_degradation_percent,
+                                        self.config.ttl_max_degradation_percent,
                                     )
                                 }) {
                                     let pos = next.iter().position(|id| *id == old).unwrap();
                                     next[pos] = *new;
                                     s.retiring = Some(old);
-                                    reason = "TTL 到期且质量劣化，备用接替";
+                                    reason = "TTL 到期，备用质量在容忍范围内，接替轮换";
                                 } else {
                                     s.ttl_waiting_reason = Some(
-                                        "TTL 到期，质量劣化未达门槛，继续使用并定期复查".into(),
+                                        "TTL 到期，最佳健康备用劣化超过容忍上限，继续使用并定期复查".into(),
                                     );
                                 }
                             }
@@ -613,7 +613,7 @@ impl Shared {
                 })
                 .filter_map(|p| {
                     if s.reserved.contains(&p.id) {
-                        // 最快候选保留跨越普通备用周期；TTL 到期后仅在质量明显落后时重采样。
+                        // 预留候选跨越普通备用周期；TTL 到期后有质量在容忍范围内的备用才重采样。
                         let best_other = s
                             .paths
                             .values()
@@ -621,6 +621,7 @@ impl Shared {
                                 other.id != p.id
                                     && !active.contains(&other.id)
                                     && other.healthy(now)
+                                    && now.duration_since(other.connected) >= Duration::from_secs(3)
                                     && !other.rotating
                             })
                             .map(Path::score)
@@ -628,7 +629,11 @@ impl Shared {
                         (!ttl.is_zero()
                             && now.duration_since(p.connected) >= ttl
                             && best_other.is_some_and(|score| {
-                                ttl_degraded(p.score(), score, self.config.ttl_degradation_percent)
+                                ttl_replacement_acceptable(
+                                    p.score(),
+                                    score,
+                                    self.config.ttl_max_degradation_percent,
+                                )
                             }))
                         .then_some((p.id, p.connected, true))
                     } else {
@@ -660,9 +665,9 @@ impl Shared {
 fn score_improves(current: f64, candidate: f64, threshold: f64) -> bool {
     candidate < current * (1.0 - threshold / 100.0)
 }
-fn ttl_degraded(current: f64, reference: f64, threshold: f64) -> bool {
-    threshold == 0.0
-        || (current > reference && current - reference >= reference * threshold / 100.0)
+fn ttl_replacement_acceptable(current: f64, candidate: f64, tolerance: f64) -> bool {
+    // 以待退役会话为基准，允许更好、相等，或仅在容忍范围内变差的备用。
+    candidate <= current || candidate - current <= current * tolerance / 100.0
 }
 
 pub struct Multipath {
@@ -1488,11 +1493,16 @@ mod tests {
         assert!(score_improves(145.0, 135.0, 5.0));
         assert!(!score_improves(100.0, 95.0, 5.0));
         assert!(!score_improves(100.0, 100.0, 0.0));
-        assert!(ttl_degraded(110.0, 100.0, 10.0));
-        assert!(!ttl_degraded(109.9, 100.0, 10.0));
-        assert!(!ttl_degraded(95.0, 100.0, 10.0));
-        assert!(ttl_degraded(95.0, 100.0, 0.0));
-        assert!(!ttl_degraded(0.0, 0.0, 10.0));
+        assert!(ttl_replacement_acceptable(100.0, 95.0, 10.0));
+        assert!(ttl_replacement_acceptable(100.0, 100.0, 10.0));
+        assert!(ttl_replacement_acceptable(100.0, 105.0, 10.0));
+        assert!(ttl_replacement_acceptable(100.0, 110.0, 10.0));
+        assert!(!ttl_replacement_acceptable(100.0, 110.1, 10.0));
+        assert!(ttl_replacement_acceptable(100.0, 100.0, 0.0));
+        assert!(ttl_replacement_acceptable(100.0, 95.0, 0.0));
+        assert!(!ttl_replacement_acceptable(100.0, 100.1, 0.0));
+        assert!(ttl_replacement_acceptable(0.0, 0.0, 10.0));
+        assert!(!ttl_replacement_acceptable(0.0, 0.1, 10.0));
     }
 
     #[tokio::test]
@@ -1529,9 +1539,9 @@ mod tests {
                 p.rtt = if p.id == old {
                     100.0
                 } else if p.id == reserve {
-                    95.0
+                    115.0
                 } else {
-                    120.0
+                    140.0
                 };
                 p.jitter = 0.0;
                 p.recent_loss = 0.0;
@@ -1559,20 +1569,33 @@ mod tests {
         client.shared.tick();
         {
             let mut s = client.shared.state.lock().unwrap();
-            assert_eq!(s.active, vec![old], "TTL 到期但劣化不达 10% 时不能切换");
+            assert_eq!(
+                s.active,
+                vec![old],
+                "TTL 到期但备用比当前差超过 10% 时必须延期"
+            );
             assert!(s.reserved.contains(&reserve));
             assert!(
                 !s.paths[&reserve].rotating,
-                "更快预留候选不能按普通备用周期丢弃"
+                "最佳预留候选不能按普通备用周期丢弃"
             );
-            assert!(s.ttl_waiting_reason.as_ref().unwrap().contains("未达门槛"));
-            s.paths.get_mut(&old).unwrap().rtt = 110.0;
+            assert!(
+                s.ttl_waiting_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("超过容忍上限")
+            );
+            s.paths.get_mut(&reserve).unwrap().rtt = 105.0;
             s.last_rotation = Instant::now() - Duration::from_secs(3);
         }
         client.shared.tick();
         {
             let s = client.shared.state.lock().unwrap();
-            assert_eq!(s.active, vec![reserve]);
+            assert_eq!(
+                s.active,
+                vec![reserve],
+                "即使当前会话最好，也应允许稍差备用接替"
+            );
             assert_eq!(s.retiring, Some(old));
             assert!(
                 s.paths[&old].connection.close_reason().is_none(),
@@ -1651,10 +1674,10 @@ mod tests {
         }
         cfg.switch_threshold_percent = 5.0;
         for threshold in [-1.0, 1001.0, f64::NAN] {
-            cfg.ttl_degradation_percent = threshold;
+            cfg.ttl_max_degradation_percent = threshold;
             assert!(cfg.validate().is_err());
         }
-        cfg.ttl_degradation_percent = 10.0;
+        cfg.ttl_max_degradation_percent = 10.0;
         cfg.stable_session_ttl_secs = 4;
         assert!(cfg.validate().is_err());
         cfg.stable_session_ttl_secs = 300;

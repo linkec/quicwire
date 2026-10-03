@@ -98,10 +98,10 @@ pub async fn read(path: &Path, json: bool) -> Result<()> {
     );
     if value["mode"] == "client" {
         println!(
-            "策略：评分改善阈值 {}%，稳定 TTL {} 秒，TTL 劣化门槛 {}%，预留 {}/{}，TTL 轮转 {} 次，启动待选 {}",
+            "策略：评分改善阈值 {}%，稳定 TTL {} 秒，TTL 最大容忍劣化 {}%，预留 {}/{}，TTL 轮转 {} 次，启动待选 {}",
             value["switch_threshold_percent"],
             value["stable_session_ttl_secs"],
-            value["ttl_degradation_percent"],
+            value["ttl_max_degradation_percent"],
             value["reserved"],
             value["reserve_sessions"],
             value["ttl_rotations"],

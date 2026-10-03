@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """仅在 smoke 脚本创建的隔离命名空间中验证评分和 TTL 生命周期。"""
+import concurrent.futures
 import json
 import pathlib
 import subprocess
@@ -15,6 +16,8 @@ server_config = (work / 'server.toml').read_text().replace(
 (work / 'server.toml').write_text(server_config)
 processes = []
 logs = []
+ping_readers = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+ping_results = {}
 
 
 def run(ns, args, timeout=30):
@@ -64,11 +67,11 @@ active_sessions = 1
 reserve_sessions = 1
 switch_threshold_percent = {threshold}
 stable_session_ttl_secs = {ttl}
-ttl_degradation_percent = {degradation}
+ttl_max_degradation_percent = {degradation}
 standby_rotate_secs = {standby}
 ''')
     p = start(client_ns, 'client')
-    initial = wait(lambda s: s['healthy'] == 2 and s['active'] == 1, 20)
+    initial = wait(lambda s: s['healthy'] == 2 and s['active'] == 1 and s['reserved'] == 1, 20)
     active = next(path for path in initial['paths'] if path['state'] == 'active')
     assert active['slot'] == 0 and active['remote'].endswith(':4433'), initial
     # 客户端选定后控制消息仍在途；等对端确认同一条路径，才统计切换期丢包。
@@ -78,13 +81,17 @@ standby_rotate_secs = {standby}
 
 
 def ping_async(count):
-    return subprocess.Popen(['ip', 'netns', 'exec', client_ns, 'ping', '-n', '-c',
+    p = subprocess.Popen(['ip', 'netns', 'exec', client_ns, 'ping', '-n', '-c',
                              str(count), '-i', '.05', '-W', '2', '10.77.0.1'],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    processes.append(p)
+    ping_results[p] = ping_readers.submit(p.communicate)
+    return p
 
 
 def finish_ping(p):
-    out, err = p.communicate(timeout=25)
+    out, err = ping_results.pop(p).result(timeout=60)
+    processes.remove(p)
     assert p.returncode == 0 and ' 0% packet loss' in out and 'DUP!' not in out, (out, err)
     print(out.split('---')[-1], flush=True)
 
@@ -116,24 +123,30 @@ try:
     print('5% 评分阈值经观察后切到较快路径，期间业务无丢包/重复，通过', flush=True)
     stop(p)
 
-    p, initial, active = client(99, ttl=5, degradation=50, standby=5)
+    # 当前路径100ms为最好；备用先120ms超过10%容忍上限，随后降到105ms。
+    run(client_ns, ['tc', 'qdisc', 'change', 'dev', 'outer0', 'parent', '1:3',
+                   'handle', '30:', 'netem', 'delay', '100ms'])
+    run(client_ns, ['tc', 'qdisc', 'change', 'dev', 'outer0', 'parent', '1:1',
+                   'handle', '10:', 'netem', 'delay', '120ms'])
+    p, initial, active = client(99, ttl=5, degradation=10, standby=5)
     reserve = next(x for x in initial['paths'] if x['reserved'])
-    ping = ping_async(320)
+    ping = ping_async(800)
     time.sleep(7)
     deferred = status()
     assert deferred['ttl_rotations'] == 0, deferred
-    assert '未达门槛' in deferred['ttl_waiting_reason'], deferred
+    assert '超过容忍上限' in deferred['ttl_waiting_reason'], deferred
     assert any(x['id'] == reserve['id'] and x['reserved'] for x in deferred['paths']), deferred
-    print('TTL 到期且劣化不足时延期；快速备用跨越普通轮转期仍预留，通过', flush=True)
-    run(client_ns, ['tc', 'qdisc', 'change', 'dev', 'outer0', 'parent', '1:3',
-                   'handle', '30:', 'netem', 'delay', '180ms'])
+    print('TTL 到期但备用差太多时延期；最佳备用跨越普通轮转期仍预留，通过', flush=True)
+    run(client_ns, ['tc', 'qdisc', 'change', 'dev', 'outer0', 'parent', '1:1',
+                   'handle', '10:', 'netem', 'delay', '105ms'])
     rotated = wait(lambda s: s['ttl_rotations'] >= 1 and s['healthy'] == 2
                    and all(x['id'] != active['id'] for x in s['paths']), 20)
     new = next(x for x in rotated['paths'] if x['slot'] == 0)
     assert new['local'] != active['local'], rotated
     assert next(x for x in rotated['paths'] if x['state'] == 'active')['id'] == reserve['id']
+    assert not ping_results[ping].done(), '业务流量必须覆盖 TTL 接替完成'
     finish_ping(ping)
-    print('TTL 劣化达标后备用接替，确认后更换旧会话源端口，业务无丢包/重复，通过', flush=True)
+    print('当前路径仍最好，TTL 允许稍差备用接替并更换旧源端口，业务无丢包/重复，通过', flush=True)
 finally:
     for p in reversed(processes):
         p.terminate()
@@ -142,5 +155,6 @@ finally:
         except subprocess.TimeoutExpired:
             p.kill()
             p.wait()
+    ping_readers.shutdown(wait=True)
     for log in logs:
         log.close()
