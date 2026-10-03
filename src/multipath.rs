@@ -248,6 +248,7 @@ pub struct Status {
     pub fec_failover_active: Option<bool>,
     pub fec: u8,
     pub fec_repair_shards: u8,
+    pub fec_repair_policy: &'static str,
     pub fec_expired_groups: u64,
     pub fec_evictions: u64,
     pub mode: String,
@@ -421,6 +422,7 @@ impl Shared {
             }),
             fec: self.config.fec,
             fec_repair_shards: self.config.fec_repair_shards,
+            fec_repair_policy: "proportional",
             fec_expired_groups: s.fec_decoder.expired_missing,
             fec_evictions: s.fec_decoder.evictions,
             mode: format!("{:?}", self.config.mode).to_lowercase(),
@@ -3136,6 +3138,40 @@ peer_address = "10.77.0.1"
                         assert_eq!(path.tx_copies - old.tx_copies, 0);
                         assert_eq!(path.fec_tx_packets - old.fec_tx_packets, u64::from(copies));
                     }
+                }
+                // 小组数据不等待 FEC；5 ms 封组后校验按实际包数计，副本仍生效。
+                for count in 1u64..=3 {
+                    let before = source.shared.snapshot().counters;
+                    for seq in 20 + count * 10..20 + count * 10 + count {
+                        assert!(
+                            sender
+                                .send(packet(seq, reverse), &mut selected, &source.shared)
+                                .await
+                        );
+                    }
+                    for _ in 0..count {
+                        tokio::time::timeout(Duration::from_secs(1), dest.received.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    }
+                    assert_eq!(
+                        source.shared.snapshot().counters.fec_tx_packets,
+                        before.fec_tx_packets
+                    );
+                    tokio::time::sleep(fec::FLUSH_AFTER).await;
+                    sender.flush(&selected, &source.shared);
+                    let repairs = if count <= 2 { 1 } else { 2 };
+                    until(|| {
+                        source.shared.snapshot().counters.fec_tx_packets
+                            == before.fec_tx_packets + repairs * u64::from(copies)
+                    })
+                    .await;
+                    assert_eq!(
+                        source.shared.snapshot().counters.tx_copies,
+                        before.tx_copies + count
+                    );
+                    assert!(sender.deadline().is_none());
                 }
             }
             client.shutdown().await;

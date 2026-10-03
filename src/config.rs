@@ -88,7 +88,8 @@ pub struct Config {
     /// 0 关闭，1–3 为每份独立校验的发送副本数；两端必须一致。
     #[serde(default)]
     pub fec: u8,
-    /// 独立校验数量（1–4），fec 是每份独立校验的副本数。
+    /// 满 4 包组的独立校验目标及上限（1–4）；小组按比例向上取整。
+    /// fec 是每份独立校验的副本数。
     #[serde(default = "default_fec_repair_shards")]
     pub fec_repair_shards: u8,
     /// 客户端允许手动备用在所有主线路不可用时接管原始数据。

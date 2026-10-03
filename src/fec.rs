@@ -1,4 +1,4 @@
-//! 系统式 GF(256) Cauchy 编码：最多 4 个原始包、1–4 份独立校验。
+//! 系统式 GF(256) Cauchy 编码：最多 4 个原始包，按配置比例向上取整生成校验。
 //! 第 0 行归一化为 XOR，单校验保持旧协议；原始包不等待编码组。
 use bytes::Bytes;
 use std::{
@@ -172,7 +172,10 @@ impl Encoder {
             return None;
         }
         let size = self.packets.iter().map(Bytes::len).max().unwrap();
-        let result = (0..self.repair_shards)
+        // 配置表示满 4 包组的目标比例及上限；非空小组向上取整，至少 1 份。
+        // packets.len() <= GROUP_SIZE，故不会超过 repair_shards。
+        let repairs = (self.packets.len() * self.repair_shards).div_ceil(GROUP_SIZE);
+        let result = (0..repairs)
             .map(|row| {
                 let mut b = vec![if row == 0 { REPAIR } else { INDEPENDENT_REPAIR }];
                 b.extend_from_slice(&self.base.to_be_bytes());
@@ -472,11 +475,48 @@ mod tests {
         )
     }
     #[test]
+    fn repair_ratio_rounds_up_for_partial_groups_without_exceeding_limit() {
+        let expected = [[1, 1, 1, 1], [1, 1, 2, 2], [1, 2, 3, 3], [1, 2, 3, 4]];
+        for target in 1..=4 {
+            for count in 1..=4 {
+                let (_, _, parity) = encoded(count, target);
+                assert_eq!(parity.len(), expected[target - 1][count - 1]);
+                for (index, repair) in parity.iter().enumerate() {
+                    match Frame::parse(repair, 1100).unwrap() {
+                        Frame::Repair {
+                            index: actual,
+                            lengths,
+                            ..
+                        } => {
+                            assert_eq!(actual, index);
+                            assert_eq!(lengths.len(), count);
+                        }
+                        _ => panic!("应生成校验帧"),
+                    }
+                }
+            }
+            // 空组无校验；连续稀疏组不会沿用上一组的大小或编码截止时间。
+            let mut encoder = Encoder::new(target);
+            assert!(encoder.flush().is_none());
+            for seq in 1..=3 {
+                assert!(
+                    encoder
+                        .push(seq, Bytes::from(vec![0; 84]), Instant::now())
+                        .is_none()
+                );
+                assert_eq!(encoder.flush().unwrap().len(), 1);
+                assert!(encoder.deadline().is_none());
+                assert!(encoder.flush().is_none());
+            }
+        }
+    }
+    #[test]
     fn cauchy_all_survivor_subsets_sparse_and_full_groups() {
         // 穷举 1–4 原始包、1–4 校验，以及任意不少于 K 份的存活组合。
         for count in 1..=4 {
             for repairs in 1..=4 {
                 let (originals, data, parity) = encoded(count, repairs);
+                let repairs = parity.len();
                 for mask in 0u16..(1 << (count + repairs)) {
                     if mask.count_ones() < count as u32 {
                         continue;
