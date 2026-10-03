@@ -1,7 +1,10 @@
 mode = "client"
-bind = "0.0.0.0:0"
-endpoint = "192.0.2.1:4433" # 替换为服务器实际地址
-# 可选：你控制的服务域名，仅用于 SNI 和 HTTP authority；不进行 DNS 解析
+bind = "0.0.0.0:0" # 每条连接使用独立 UDP socket，端口 0 允许轮转时更换五元组
+endpoints = ["192.0.2.1:4433-4440"] # 替换为服务器实际 IP；支持多个 IP 和端口范围
+max_sessions = 8
+active_sessions = 2
+standby_rotate_secs = 180 # 连续备用 180 秒后重新采样；0 关闭轮转
+# 可选：你控制的服务域名，仅用于 SNI 和 HTTP authority
 # server_name = "vpn.example.com"
 private_key_file = "client.key"
 peer_public_key = "替换为服务端 keygen 输出的完整公钥"
@@ -9,6 +12,4 @@ tun_name = "qw0"
 tun_address = "10.77.0.2/30"
 peer_address = "10.77.0.1"
 mtu = 1100
-
-# Linux TUN 分段／合并；不支持 offload 时可关闭
 tun_offload = true

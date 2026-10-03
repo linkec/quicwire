@@ -58,13 +58,25 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.driver.abort();
-        self.active.connection.close(0u32.into(), b"session ended");
+        if self.active.connection.close_reason().is_none() {
+            self.active.connection.close(0u32.into(), b"session ended");
+        }
     }
 }
 
 pub async fn negotiate(connection: &Connection, config: &Config) -> Result<Session> {
+    negotiate_mode(connection, config, false).await
+}
+pub async fn negotiate_multipath(connection: &Connection, config: &Config) -> Result<Session> {
+    negotiate_mode(connection, config, true).await
+}
+async fn negotiate_mode(
+    connection: &Connection,
+    config: &Config,
+    multipath: bool,
+) -> Result<Session> {
     ensure!(
-        connection.max_datagram_size().unwrap_or(0) >= usize::from(config.mtu) + 9,
+        connection.max_datagram_size().unwrap_or(0) >= usize::from(config.mtu) + 32,
         "对端 DATAGRAM 能力不足"
     );
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -73,13 +85,15 @@ pub async fn negotiate(connection: &Connection, config: &Config) -> Result<Sessi
     let cfg = config.clone();
     let driver = tokio::spawn(async move {
         let result = match cfg.mode {
-            Mode::Client => client(&conn, &cfg, ready_tx, packet_tx).await,
-            Mode::Server => server(&conn, &cfg, ready_tx, packet_tx).await,
+            Mode::Client => client(&conn, &cfg, ready_tx, packet_tx, multipath).await,
+            Mode::Server => server(&conn, &cfg, ready_tx, packet_tx, multipath).await,
         };
         if let Err(error) = result {
             eprintln!("HTTP/3 会话结束：{error:#}");
         }
-        conn.close(0x100u32.into(), b"HTTP session ended");
+        if conn.close_reason().is_none() {
+            conn.close(0x100u32.into(), b"HTTP session ended");
+        }
     });
     // 提前构造守卫，外层取消协商也会释放驱动任务与连接。
     let mut session = Session {
@@ -97,7 +111,7 @@ pub async fn negotiate(connection: &Connection, config: &Config) -> Result<Sessi
     Ok(session)
 }
 
-fn headers(config: &Config) -> HeaderMap {
+fn headers(config: &Config, multipath: bool) -> HeaderMap {
     let mut h = HeaderMap::new();
     h.insert("capsule-protocol", "?1".parse().unwrap());
     h.insert(
@@ -109,10 +123,22 @@ fn headers(config: &Config) -> HeaderMap {
         config.peer_address.to_string().parse().unwrap(),
     );
     h.insert("x-tunnel-mtu", config.mtu.to_string().parse().unwrap());
+    if multipath {
+        h.insert("x-tunnel-version", "3".parse().unwrap());
+    }
     h
 }
 
-fn check_headers(h: &HeaderMap, config: &Config) -> Result<()> {
+fn check_headers(h: &HeaderMap, config: &Config, multipath: bool) -> Result<()> {
+    ensure!(
+        if multipath {
+            h.get_all("x-tunnel-version").iter().count() == 1
+                && h.get("x-tunnel-version").is_some_and(|v| v == "3")
+        } else {
+            !h.contains_key("x-tunnel-version")
+        },
+        "隧道版本不匹配"
+    );
     let expected = [
         ("capsule-protocol", "?1".to_string()),
         ("x-tunnel-address", config.peer_address.to_string()),
@@ -134,6 +160,7 @@ async fn client(
     config: &Config,
     ready: oneshot::Sender<u64>,
     packets: mpsc::Sender<Bytes>,
+    multipath: bool,
 ) -> Result<()> {
     let (mut driver, mut sender) = h3::client::builder()
         .enable_datagram(true)
@@ -157,9 +184,13 @@ async fn client(
     let mut request = Request::builder()
         .method("CONNECT")
         .uri(format!("https://{}{PATH}", config.http_authority()?))
-        .extension(h3::ext::Protocol::CONNECT_IP)
+        .extension(if multipath {
+            h3::ext::Protocol::QUICWIRE
+        } else {
+            h3::ext::Protocol::CONNECT_IP
+        })
         .body(())?;
-    *request.headers_mut() = headers(config);
+    *request.headers_mut() = headers(config, multipath);
     let mut stream = tokio::select! {
         result = sender.send_request(request) => result?,
         error = driver.wait_idle() => bail!("HTTP/3 连接关闭：{error}"),
@@ -173,7 +204,7 @@ async fn client(
         "CONNECT-IP 被拒绝：{}",
         response.status()
     );
-    check_headers(response.headers(), config)?;
+    check_headers(response.headers(), config, multipath)?;
     let id = stream.id().into_inner();
     ready.send(id).map_err(|_| anyhow::anyhow!("隧道已取消"))?;
     let active = ActiveSession {
@@ -188,7 +219,7 @@ async fn client(
                 let mut data = data?.context("CONNECT-IP 响应已结束")?;
                 capsules.append(data.copy_to_bytes(data.remaining()))?;
                 while let Some((kind, payload)) = capsules.next()? {
-                    handle_capsule(kind, payload, &active, config, &packets).await?;
+                    handle_capsule(kind, payload, &active, config, &packets, multipath).await?;
                 }
             }
         }
@@ -200,6 +231,7 @@ async fn server(
     config: &Config,
     ready: oneshot::Sender<u64>,
     packets: mpsc::Sender<Bytes>,
+    multipath: bool,
 ) -> Result<()> {
     let mut driver = h3::server::builder()
         .enable_extended_connect(true)
@@ -210,11 +242,16 @@ async fn server(
     let resolver = driver.accept().await?.context("对端未发送 HTTP 请求")?;
     let (request, mut stream) = resolver.resolve_request().await?;
     let valid = request.method() == http::Method::CONNECT
-        && request.extensions().get::<h3::ext::Protocol>() == Some(&h3::ext::Protocol::CONNECT_IP)
+        && request.extensions().get::<h3::ext::Protocol>()
+            == Some(&if multipath {
+                h3::ext::Protocol::QUICWIRE
+            } else {
+                h3::ext::Protocol::CONNECT_IP
+            })
         && request.uri().scheme_str() == Some("https")
         && request.uri().path_and_query().map(|p| p.as_str()) == Some(PATH)
         && request.uri().authority().is_some();
-    if !valid || check_headers(request.headers(), config).is_err() {
+    if !valid || check_headers(request.headers(), config, multipath).is_err() {
         stream
             .send_response(
                 Response::builder()
@@ -242,7 +279,7 @@ async fn server(
     })
     .await?;
     let mut response = Response::builder().status(StatusCode::OK).body(())?;
-    *response.headers_mut() = headers(config);
+    *response.headers_mut() = headers(config, multipath);
     stream.send_response(response).await?;
     let id = stream.id().into_inner();
     ready.send(id).map_err(|_| anyhow::anyhow!("隧道已取消"))?;
@@ -263,7 +300,7 @@ async fn server(
                 let mut data = data?.context("CONNECT-IP 请求已结束")?;
                 capsules.append(data.copy_to_bytes(data.remaining()))?;
                 while let Some((kind, payload)) = capsules.next()? {
-                    handle_capsule(kind, payload, &active, config, &packets).await?;
+                    handle_capsule(kind, payload, &active, config, &packets, multipath).await?;
                 }
             }
         }
@@ -307,11 +344,15 @@ async fn handle_capsule(
     active: &ActiveSession,
     config: &Config,
     packets: &mpsc::Sender<Bytes>,
+    multipath: bool,
 ) -> Result<()> {
     match kind {
         0 => {
             let (context, offset) = varint(&payload).context("DATAGRAM Capsule 缺少 Context ID")?;
-            if context == 0 && payload.len() - offset <= usize::from(config.mtu) {
+            if context == 0
+                && payload.len() - offset
+                    <= usize::from(config.mtu) + if multipath { 32 } else { 0 }
+            {
                 packets
                     .send(active.encode(&payload[offset..]))
                     .await

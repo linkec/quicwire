@@ -9,3 +9,8 @@ pub mod transport;
 pub mod tunnel;
 
 pub mod http3;
+
+pub mod multipath;
+
+#[cfg(unix)]
+pub mod status;

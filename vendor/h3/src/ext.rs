@@ -9,6 +9,8 @@ use std::str::FromStr;
 pub struct Protocol(ProtocolInner);
 
 impl Protocol {
+    /// quicwire private multipath protocol over HTTP Datagrams.
+    pub const QUICWIRE: Protocol = Protocol(ProtocolInner::Quicwire);
     /// RFC 9484 IP proxying protocol.
     pub const CONNECT_IP: Protocol = Protocol(ProtocolInner::ConnectIp);
     /// WebTransport protocol
@@ -20,6 +22,7 @@ impl Protocol {
     #[inline]
     pub fn as_str(&self) -> &str {
         match self.0 {
+            ProtocolInner::Quicwire => "quicwire",
             ProtocolInner::ConnectIp => "connect-ip",
             ProtocolInner::WebTransport => "webtransport",
             ProtocolInner::ConnectUdp => "connect-udp",
@@ -29,6 +32,7 @@ impl Protocol {
 
 #[derive(Copy, PartialEq, Debug, Clone)]
 enum ProtocolInner {
+    Quicwire,
     ConnectIp,
     WebTransport,
     ConnectUdp,
@@ -42,6 +46,7 @@ impl FromStr for Protocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
+            "quicwire" => Ok(Self(ProtocolInner::Quicwire)),
             "connect-ip" => Ok(Self(ProtocolInner::ConnectIp)),
             "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
             "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),

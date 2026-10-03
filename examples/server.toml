@@ -1,11 +1,9 @@
 mode = "server"
-bind = "0.0.0.0:4433"
+listen = ["0.0.0.0:4433-4440"] # 可指定本机 IP，例如 "192.0.2.1:4433-4440"
 private_key_file = "server.key"
 peer_public_key = "替换为客户端 keygen 输出的完整公钥"
 tun_name = "qw0"
 tun_address = "10.77.0.1/30"
 peer_address = "10.77.0.2"
 mtu = 1100
-
-# Linux TUN 分段／合并；不支持 offload 时可关闭
 tun_offload = true

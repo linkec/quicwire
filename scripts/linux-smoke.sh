@@ -71,10 +71,22 @@ wait_connected() {
   done
   echo '隧道未在限定时间恢复' >&2; return 1
 }
+if [[ "${QUICWIRE_TEST_MULTIPATH:-false}" == true ]]; then
+  sed -i 's/bind = "192.0.2.1:4433"/listen = ["192.0.2.1:4433-4436"]/' "$work/server.toml"
+  sed -i 's/endpoint = "192.0.2.1:4433"/endpoints = ["192.0.2.1:4433-4436"]/' "$work/client.toml"
+  cat >> "$work/client.toml" <<EOF_MP
+max_sessions = 4
+active_sessions = 2
+standby_rotate_secs = 5
+EOF_MP
+fi
 start_server
 ip netns exec "$client_ns" "$binary" run --config "$work/client.toml" > "$work/client.log" 2>&1 &
 client_pid=$!
 wait_connected
+if [[ "${QUICWIRE_TEST_MULTIPATH:-false}" == true ]]; then
+  python3 "$script_dir/multipath-check.py" "$binary" "$server_ns" "$client_ns" "$work"
+fi
 ip netns exec "$client_ns" ping -c 3 -W 2 -M do -s "$((mtu-28))" 10.77.0.1
 ip netns exec "$server_ns" ping -c 3 -W 2 10.77.0.2
 if ip netns exec "$client_ns" ping -c 1 -W 1 -M do -s "$((mtu-27))" 10.77.0.1; then

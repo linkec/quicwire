@@ -2,7 +2,7 @@
 
 基于 **Rust + Quinn** 的独立 QUIC IP 隧道，使用本地公私钥和预配置 peer 公钥，不依赖认证 API、账号或数据库。
 
-当前已实现基础版：Linux 两台主机之间的单路径 HTTP/3 CONNECT-IP + QUIC DATAGRAM + IPv4 TUN，包含双向公钥认证、配置校验、自动重连、源地址约束和 systemd 示例。多路径复制、去重和动态选路仍在设计中。
+当前已实现基础版：Linux 两台主机之间的多连接 HTTP/3 + QUIC DATAGRAM + IPv4 TUN，包含双向公钥认证、同包多发与去重、质量选路、备用五元组轮转、本地状态监控和 systemd 示例。所有入口归属于同一服务端实例，当前仍为单 peer。
 
 ```mermaid
 flowchart LR
@@ -30,7 +30,14 @@ sudo quicwire run --config quicwire.toml
 
 基础版只传输两端主机的隧道地址流量，内层 MTU 默认 1100；不配置默认路由、NAT 或第三方子网转发。公钥配置方式借鉴 WireGuard，使用 Ed25519 + TLS 1.3 公钥固定验证（X.509 容器），协议与密钥格式均独立。
 
-从 0.2.0 起，线上协议采用真实 HTTP/3：ALPN 为 `h3`，通过 Extended CONNECT 建立 IP 隧道，以 HTTP Datagrams 传输 IP 包。原有公私钥和配置可以继续使用，但两端程序必须同时升级，不能与 0.1.x 混用。可选 `server_name` 配置 SNI；不配置时使用 endpoint IP，不发送项目名。详见 [HTTP/3 协议与外观边界](docs/http3.md)。
+当前版本 0.3.0：ALPN 为 `h3`，使用真实 HTTP/3 Extended CONNECT 与 HTTP Datagrams，私有 `:protocol=quicwire` 帧提供跨连接序号、探测和激活集合控制。原有公私钥与单连接配置仍可使用，但两端程序必须同时升级，不能与 0.2.x 混用。可选 `server_name` 配置 SNI。详见 [多路径配置与监控](docs/multipath.md) 和 [HTTP/3 协议与外观边界](docs/http3.md)。
+
+客户端 `endpoints` 支持多个 IP/端口范围；`max_sessions=8` 维持 8 条连接，`active_sessions=2` 双向发送两份副本并去重，其余连接持续探测。`standby_rotate_secs=180` 使连续备用三分钟的连接更换 UDP 源端口重新采样。服务端 `listen=["0.0.0.0:4433-4440"]` 提供多个入口。
+
+```sh
+sudo quicwire status --config /etc/quicwire/quicwire.toml
+sudo quicwire status --config /etc/quicwire/quicwire.toml --json
+```
 
 ## 开发检查
 
@@ -46,7 +53,7 @@ Rust 版本和依赖分别由 `rust-toolchain.toml`、`Cargo.lock` 固定。CI �
 
 ## 后续设计
 
-用户于 2026-10-02 调整顺序，先交付基础 QUIC + TUN 隧道并做双机测试。以下文档保留多路径目标和未决事项，不能据此认为完整多路径能力已经实现：
+用户于 2026-10-02 调整顺序，先交付基础 QUIC + TUN 隧道并做双机测试。以下文档保留更完整平台目标和未决事项，已实现边界以多路径配置文档为准：
 
 - [需求与验收边界](docs/requirements.md)
 - [Rust + Quinn 选型记录](docs/architecture.md)

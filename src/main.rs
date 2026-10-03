@@ -31,6 +31,13 @@ enum Command {
         #[arg(long)]
         config: PathBuf,
     },
+    /// 查看本机运行状态
+    Status {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     /// 启动 Linux 隧道，需要 root 或 CAP_NET_ADMIN
     Run {
         #[arg(long)]
@@ -56,6 +63,13 @@ async fn main() -> Result<()> {
                 "配置有效 mode={:?} tun={} local={} peer={} mtu={}",
                 config.mode, config.tun_name, config.tun_address, config.peer_address, config.mtu
             );
+        }
+        Command::Status { config, json } => {
+            let config = Config::load(&config)?;
+            #[cfg(unix)]
+            quicwire::status::read(&config.status_path(), json).await?;
+            #[cfg(not(unix))]
+            anyhow::bail!("状态命令仅支持 Unix 平台");
         }
         Command::Run { config } => {
             let config = Config::load(&config)?;
