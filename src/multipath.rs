@@ -1954,6 +1954,9 @@ mod tests {
         cc.active_sessions = 2;
         cc.standby_rotate_secs = 5;
         cc.reserve_sessions = 0;
+        // 本例只验证备用到龄轮转与故障提升；真实 RTT 抖动不能把目标备用提前激活。
+        // 质量切换由独立预设及 netem 测试覆盖，故障替换仍绕过此阈值。
+        cc.switch_threshold_percent = 99.9999;
         let mut server = Multipath::start(sc.clone(), clone_identity(&sid)).unwrap();
         let mut client = Multipath::start(cc, clone_identity(&cid)).unwrap();
         until(|| {
