@@ -126,6 +126,12 @@ fn headers(config: &Config, multipath: bool) -> HeaderMap {
     if multipath {
         h.insert("x-tunnel-version", "3".parse().unwrap());
     }
+    if config.fec > 0 {
+        h.insert(
+            "x-tunnel-fec",
+            format!("xor4-v1-{}", config.fec).parse().unwrap(),
+        );
+    }
     h
 }
 
@@ -138,6 +144,16 @@ fn check_headers(h: &HeaderMap, config: &Config, multipath: bool) -> Result<()> 
             !h.contains_key("x-tunnel-version")
         },
         "隧道版本不匹配"
+    );
+    ensure!(
+        if config.fec > 0 {
+            h.get_all("x-tunnel-fec").iter().count() == 1
+                && h.get("x-tunnel-fec")
+                    .is_some_and(|v| v == format!("xor4-v1-{}", config.fec).as_str())
+        } else {
+            !h.contains_key("x-tunnel-fec")
+        },
+        "FEC 配置不匹配，必须两端一致"
     );
     let expected = [
         ("capsule-protocol", "?1".to_string()),

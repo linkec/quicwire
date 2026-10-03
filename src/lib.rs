@@ -15,3 +15,5 @@ pub mod multipath;
 
 #[cfg(unix)]
 pub mod status;
+
+pub mod fec;

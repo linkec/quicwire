@@ -1,6 +1,7 @@
 //! 多条独立 H3 连接、双向复制、滑动窗口去重和健康选路。
 use crate::{
     config::{Config, Mode},
+    fec::{self, Decoder, Encoder, Frame},
     http3::{self, Session},
     identity::{Identity, PublicKey},
     packet::valid_ipv4,
@@ -104,6 +105,13 @@ pub struct Counters {
     pub rx_queue_drops: u64,
     pub send_errors: u64,
     pub partial_replication: u64,
+    pub tx_data_bytes: u64,
+    pub fec_tx_packets: u64,
+    pub fec_tx_bytes: u64,
+    pub fec_rx_packets: u64,
+    pub fec_recovered_packets: u64,
+    pub fec_recovered_bytes: u64,
+    pub fec_queue_drops: u64,
 }
 struct Path {
     id: u64,
@@ -164,6 +172,7 @@ struct State {
     configured_max: usize,
     configured_active: usize,
     dedup: Dedup,
+    fec_decoder: Decoder,
     counters: Counters,
     last_switch: Instant,
     challenger: Option<(Vec<u64>, Instant)>,
@@ -225,6 +234,9 @@ pub struct PathStatus {
 }
 #[derive(Serialize)]
 pub struct Status {
+    pub fec: u8,
+    pub fec_expired_groups: u64,
+    pub fec_evictions: u64,
     pub mode: String,
     pub tun: String,
     pub uptime_seconds: u64,
@@ -369,6 +381,9 @@ impl Shared {
             .count();
         let active = paths.iter().filter(|p| p.state == "active").count();
         Status {
+            fec: self.config.fec,
+            fec_expired_groups: s.fec_decoder.expired_missing,
+            fec_evictions: s.fec_decoder.evictions,
             mode: format!("{:?}", self.config.mode).to_lowercase(),
             tun: self.config.tun_name.clone(),
             uptime_seconds: s.started.elapsed().as_secs(),
@@ -451,6 +466,7 @@ impl Shared {
         let policy = self.config.selection_policy;
         let now = Instant::now();
         let mut s = self.state.lock().unwrap();
+        s.fec_decoder.expire(now);
         let ttl = Duration::from_secs(self.config.stable_session_ttl_secs);
         if self.config.mode == Mode::Client {
             let measured: Vec<_> = s
@@ -922,6 +938,7 @@ impl Multipath {
                 configured_max: config.max_sessions,
                 configured_active: config.active_sessions,
                 dedup: Dedup::default(),
+                fec_decoder: Decoder::default(),
                 counters: Counters::default(),
                 last_switch: now,
                 challenger: None,
@@ -1110,6 +1127,7 @@ fn bind_group(shared: &Shared, peer: Epoch, max: usize, active: usize) -> Result
         s.active.clear();
         s.generation = 0;
         s.dedup = Dedup::default();
+        s.fec_decoder = Decoder::default();
         s.challenger = None;
         s.startup_pending = shared.config.mode == Mode::Client;
         s.selection_started = now;
@@ -1263,10 +1281,18 @@ async fn send_loop(
             return Err(error.into());
         }
         let mut s = shared.state.lock().unwrap();
-        s.counters.tx_copies += 1;
+        if data.first() == Some(&fec::REPAIR) {
+            s.counters.fec_tx_packets += 1;
+            s.counters.fec_tx_bytes += data.len() as u64;
+        } else {
+            s.counters.tx_copies += 1;
+            s.counters.tx_data_bytes += data.len() as u64;
+        }
         if let Some(p) = s.paths.get_mut(&id) {
-            p.tx_copies += 1;
-            p.tx_bytes += data.len().saturating_sub(9) as u64;
+            if data.first() != Some(&fec::REPAIR) {
+                p.tx_copies += 1;
+            }
+            p.tx_bytes += data.len() as u64;
         }
     }
     bail!("路径发送队列关闭")
@@ -1283,6 +1309,48 @@ struct PathReceiver<'a> {
     nonce: u64,
 }
 impl PathReceiver<'_> {
+    fn deliver(&self, sequence: u64, packet: Bytes, recovered: bool) {
+        if !valid_ipv4(
+            &packet,
+            self.config.peer_address,
+            self.config.tun_address.addr(),
+            self.config.mtu,
+        ) {
+            self.shared.counters(|c| c.invalid += 1);
+            return;
+        }
+        let mut state = self.shared.state.lock().unwrap();
+        if !recovered && let Some(path) = state.paths.get_mut(&self.id) {
+            path.rx_copies += 1;
+            path.rx_bytes += packet.len() as u64;
+        }
+        match state.dedup.insert(sequence) {
+            Verdict::Duplicate => {
+                state.counters.duplicates += 1;
+                if let Some(path) = state.paths.get_mut(&self.id) {
+                    path.rx_duplicates += 1;
+                }
+            }
+            Verdict::TooOld => state.counters.too_old += 1,
+            Verdict::New => {
+                let size = packet.len() as u64;
+                if self.incoming.try_send(packet).is_err() {
+                    state.counters.rx_queue_drops += 1;
+                } else {
+                    state.counters.rx_effective_packets += 1;
+                    state.counters.rx_effective_bytes += size;
+                    if recovered {
+                        state.counters.fec_recovered_packets += 1;
+                        state.counters.fec_recovered_bytes += size;
+                    }
+                    if let Some(path) = state.paths.get_mut(&self.id) {
+                        path.rx_effective_packets += 1;
+                        path.rx_effective_bytes += size;
+                    }
+                }
+            }
+        }
+    }
     fn probe(&mut self) -> Result<()> {
         self.nonce = self.nonce.checked_add(1).context("探测序号耗尽")?;
         let mut state = self.shared.state.lock().unwrap();
@@ -1349,47 +1417,48 @@ impl PathReceiver<'_> {
                     .send_datagram(self.session.active.encode(self.welcome))?;
             }
             2 if client => (),
-            3 if payload.len() >= 9 => {
-                let packet = &payload[9..];
-                if !valid_ipv4(
-                    packet,
-                    self.config.peer_address,
-                    self.config.tun_address.addr(),
-                    self.config.mtu,
-                ) {
+            3 if payload.len() >= 9 && self.config.fec == 0 => {
+                self.deliver(
+                    number(&payload[1..9]).unwrap(),
+                    Bytes::copy_from_slice(&payload[9..]),
+                    false,
+                );
+            }
+            fec::DATA | fec::REPAIR if self.config.fec > 0 => {
+                let Some(frame) = Frame::parse(payload, self.config.mtu as usize) else {
                     self.shared.counters(|c| c.invalid += 1);
                     return Ok(());
-                }
-                let sequence = number(&payload[1..9]).unwrap();
-                let mut state = self.shared.state.lock().unwrap();
-                if let Some(path) = state.paths.get_mut(&self.id) {
-                    path.rx_copies += 1;
-                    path.rx_bytes += packet.len() as u64;
-                }
-                match state.dedup.insert(sequence) {
-                    Verdict::Duplicate => {
-                        state.counters.duplicates += 1;
-                        if let Some(path) = state.paths.get_mut(&self.id) {
-                            path.rx_duplicates += 1;
-                        }
+                };
+                if let Frame::Data {
+                    base,
+                    index,
+                    packet,
+                } = &frame
+                {
+                    if !valid_ipv4(
+                        packet,
+                        self.config.peer_address,
+                        self.config.tun_address.addr(),
+                        self.config.mtu,
+                    ) {
+                        self.shared.counters(|c| c.invalid += 1);
+                        return Ok(());
                     }
-                    Verdict::TooOld => state.counters.too_old += 1,
-                    Verdict::New => {
-                        if self
-                            .incoming
-                            .try_send(Bytes::copy_from_slice(packet))
-                            .is_err()
-                        {
-                            state.counters.rx_queue_drops += 1;
-                        } else {
-                            state.counters.rx_effective_packets += 1;
-                            state.counters.rx_effective_bytes += packet.len() as u64;
-                            if let Some(path) = state.paths.get_mut(&self.id) {
-                                path.rx_effective_packets += 1;
-                                path.rx_effective_bytes += packet.len() as u64;
-                            }
-                        }
-                    }
+                    self.deliver(*base + *index as u64, packet.clone(), false);
+                } else {
+                    self.shared.counters(|c| c.fec_rx_packets += 1);
+                }
+                let recovered = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap()
+                    .fec_decoder
+                    .receive(frame, Instant::now());
+                match recovered {
+                    Ok(Some((seq, packet))) => self.deliver(seq, packet, true),
+                    Err(_) => self.shared.counters(|c| c.invalid += 1),
+                    _ => (),
                 }
             }
             4 if !client => {
@@ -1500,6 +1569,111 @@ async fn receive_loop(
         tokio::select! {
             _ = timer.tick() => receiver.probe()?,
             data = receiver.session.read_datagram() => receiver.receive(data?)?,
+        }
+    }
+}
+
+/// FEC 发送器：原始包单发，校验走另一条激活路径；单路径降级时仍可原路校验。
+#[derive(Default)]
+pub struct FecSender {
+    encoder: Encoder,
+    primary: Option<u64>,
+}
+impl FecSender {
+    pub fn deadline(&self) -> Option<Instant> {
+        self.encoder.deadline()
+    }
+    fn repair(
+        &mut self,
+        data: Bytes,
+        selected: &watch::Receiver<Vec<PathSender>>,
+        shared: &Shared,
+    ) {
+        let mut paths = selected.borrow().clone();
+        let state = shared.state.lock().unwrap();
+        paths.sort_by(|a, b| {
+            (a.id == self.primary.unwrap_or(0))
+                .cmp(&(b.id == self.primary.unwrap_or(0)))
+                .then_with(|| {
+                    let score = |id| {
+                        state
+                            .paths
+                            .get(&id)
+                            .map(|p| p.score(SelectionPolicy::LowLoss))
+                            .unwrap_or(f64::MAX)
+                    };
+                    score(a.id).total_cmp(&score(b.id))
+                })
+        });
+        drop(state);
+        // 同一份校验最多发 3 份，先分散到不同激活路径；路径不足时循环复用。
+        // 每份只成功入队一次；排队失败时尝试其它激活路径，不阻塞原始数据。
+        let count = paths.len();
+        for copy in 0..shared.config.fec as usize {
+            let mut sent = false;
+            for offset in 0..count {
+                let p = &paths[(copy + offset) % count];
+                if p.sender.try_send(data.clone()).is_ok() {
+                    sent = true;
+                    break;
+                }
+            }
+            if !sent {
+                shared.counters(|c| c.fec_queue_drops += 1);
+            }
+        }
+    }
+    pub fn flush(&mut self, selected: &watch::Receiver<Vec<PathSender>>, shared: &Shared) {
+        if let Some(data) = self.encoder.flush() {
+            self.repair(data, selected, shared);
+        }
+        self.primary = None;
+    }
+    pub async fn send(
+        &mut self,
+        data: Bytes,
+        selected: &mut watch::Receiver<Vec<PathSender>>,
+        shared: &Shared,
+    ) -> bool {
+        if shared.config.fec == 0 {
+            return replicate(data, selected, shared).await;
+        }
+        let seq = number(&data[1..9]).expect("内部业务包序号");
+        if !self.encoder.accepts(seq) {
+            self.flush(selected, shared);
+        }
+        let frame = self.encoder.data(seq, &data[9..]);
+        loop {
+            let notified = shared.available.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut paths = selected.borrow_and_update().clone();
+            if paths.is_empty() {
+                shared.counters(|c| c.disconnected += 1);
+                return false;
+            }
+            {
+                let state = shared.state.lock().unwrap();
+                paths.sort_by(|a, b| {
+                    (Some(a.id) != self.primary)
+                        .cmp(&(Some(b.id) != self.primary))
+                        .then_with(|| {
+                            let rtt = |id| state.paths.get(&id).map(|p| p.rtt).unwrap_or(f64::MAX);
+                            rtt(a.id).total_cmp(&rtt(b.id))
+                        })
+                });
+            }
+            for p in paths {
+                if p.sender.try_send(frame.clone()).is_ok() {
+                    self.primary = Some(p.id);
+                    if let Some(repair) = self.encoder.push(seq, data.slice(9..), Instant::now()) {
+                        self.repair(repair, selected, shared);
+                        self.primary = None;
+                    }
+                    return true;
+                }
+            }
+            tokio::select! { _=notified=>(), r=selected.changed()=>{if r.is_err(){return false;}} }
         }
     }
 }
@@ -2429,5 +2603,135 @@ mod tests {
             .unwrap()
         );
         assert_eq!(rx.recv().await.unwrap(), "packet");
+    }
+    #[tokio::test]
+    async fn fec_cross_path_recovery_both_directions_and_late_duplicate() {
+        for copies in 1..=3 {
+            let (sid, _) = Identity::generate().unwrap();
+            let (cid, _) = Identity::generate().unwrap();
+            let port = free_ports();
+            let mut sc = config(Mode::Server, &cid.public, port);
+            sc.bind = "0.0.0.0:0".parse().unwrap();
+            sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 1)];
+            sc.fec = copies;
+            let mut cc = config(Mode::Client, &sid.public, port);
+            cc.endpoints = sc.listen.iter().cloned().map(Into::into).collect();
+            cc.max_sessions = 2;
+            cc.active_sessions = 2;
+            cc.fec = copies;
+            let mut server = Multipath::start(sc, sid).unwrap();
+            let mut client = Multipath::start(cc, cid).unwrap();
+            until(|| client.shared.snapshot().active == 2 && server.shared.snapshot().active == 2)
+                .await;
+            for reverse in [false, true] {
+                let (source, dest) = if reverse {
+                    (&mut server, &mut client)
+                } else {
+                    (&mut client, &mut server)
+                };
+                let paths = source.selected.borrow().clone();
+                let mut e = Encoder::default();
+                let mut frames = Vec::new();
+                let mut repair = None;
+                for seq in 1..=4 {
+                    let p = packet(seq, reverse);
+                    frames.push(e.data(seq, &p[9..]));
+                    repair = e.push(seq, p.slice(9..), Instant::now());
+                }
+                // 模拟中间一个原始业务包丢失，校验通过另一条真实 H3/QUIC 连接发送。
+                paths[1].sender.send(repair.unwrap()).await.unwrap();
+                for i in [3, 0, 2] {
+                    paths[0].sender.send(frames[i].clone()).await.unwrap();
+                }
+                for _ in 0..4 {
+                    tokio::time::timeout(Duration::from_secs(2), dest.received.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                until(|| dest.shared.snapshot().counters.fec_recovered_packets == 1).await;
+                paths[0].sender.send(frames[1].clone()).await.unwrap();
+                until(|| dest.shared.snapshot().counters.duplicates == 1).await;
+                assert!(dest.received.try_recv().is_err());
+                assert_eq!(dest.shared.snapshot().counters.rx_effective_packets, 4);
+            }
+            // 正常高密度发送：4 份原始数据 + 1 份校验，不再双发原始包。
+            let before = client.shared.snapshot().counters;
+            let mut tx = FecSender::default();
+            let mut selected = client.selected.clone();
+            for seq in 10..14 {
+                assert!(
+                    tx.send(packet(seq, false), &mut selected, &client.shared)
+                        .await
+                );
+            }
+            for _ in 0..4 {
+                tokio::time::timeout(Duration::from_secs(2), server.received.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            until(|| {
+                client.shared.snapshot().counters.fec_tx_packets
+                    == before.fec_tx_packets + u64::from(copies)
+            })
+            .await;
+            assert_eq!(
+                client.shared.snapshot().counters.tx_copies,
+                before.tx_copies + 4
+            );
+            // 尾包无后续流量时也可以独立 flush。
+            assert!(
+                tx.send(packet(20, false), &mut selected, &client.shared)
+                    .await
+            );
+            assert!(tx.deadline().is_some());
+            tx.flush(&selected, &client.shared);
+            until(|| {
+                client.shared.snapshot().counters.fec_tx_packets
+                    == before.fec_tx_packets + 2 * u64::from(copies)
+            })
+            .await;
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn fec_mismatch_rejected_before_registering_path() {
+        let (sid, _) = Identity::generate().unwrap();
+        let (cid, _) = Identity::generate().unwrap();
+        let port = free_ports();
+        let sc = config(Mode::Server, &cid.public, port);
+        let mut cc = config(Mode::Client, &sid.public, port);
+        cc.endpoints = vec![format!("127.0.0.1:{port}").into()];
+        cc.max_sessions = 2;
+        cc.active_sessions = 2;
+        cc.fec = 1;
+        let mut server = Multipath::start(sc, sid).unwrap();
+        let mut client = Multipath::start(cc, cid).unwrap();
+        until(|| client.shared.snapshot().connection_failures > 0).await;
+        assert_eq!(client.shared.snapshot().connected, 0);
+        assert_eq!(server.shared.snapshot().connected, 0);
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+    #[test]
+    fn fec_numeric_config_limits_and_default() {
+        let (identity, _) = Identity::generate().unwrap();
+        let mut c = config(Mode::Client, &identity.public, 4433);
+        c.endpoints = vec!["127.0.0.1:4433-4434".into()];
+        assert_eq!(c.fec, 0);
+        c.max_sessions = 2;
+        c.active_sessions = 2;
+        for copies in 0..=3 {
+            c.fec = copies;
+            assert!(c.validate().is_ok());
+        }
+        c.fec = 4;
+        assert!(c.validate().is_err());
+        c.fec = 1;
+        c.active_sessions = 1;
+        assert!(c.validate().is_err());
     }
 }

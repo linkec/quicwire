@@ -82,6 +82,9 @@ pub struct Config {
     /// Linux TUN 的 TCP/UDP 分段与合并；兼容不支持 offload 的环境时可关闭。
     #[serde(default = "default_tun_offload")]
     pub tun_offload: bool,
+    /// 0 关闭，1–3 为每组 XOR 校验的发送份数；两端必须一致。
+    #[serde(default)]
+    pub fec: u8,
 }
 
 fn default_bind() -> SocketAddr {
@@ -146,6 +149,10 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         PublicKey::parse(&self.peer_public_key)?;
+        ensure!(
+            self.fec <= 3,
+            "fec 必须为 0–3：0 关闭，1–3 为每组校验副本数"
+        );
         ensure!(
             self.switch_threshold_percent.is_finite()
                 && (0.0..100.0).contains(&self.switch_threshold_percent),
@@ -245,6 +252,10 @@ impl Config {
                 self.listen_addresses()?;
             }
             Mode::Client => {
+                ensure!(
+                    self.fec == 0 || self.active_sessions >= 2,
+                    "fec 要求 active_sessions 至少为 2"
+                );
                 ensure!(self.listen.is_empty(), "client 模式不能设置 listen");
                 ensure!(
                     self.max_sessions == 1 || self.bind.port() == 0,

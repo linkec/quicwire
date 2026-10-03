@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     identity::Identity,
-    multipath::{Multipath, PathSender, Shared, replicate},
+    multipath::{FecSender, Multipath, PathSender, Shared},
     packet::valid_ipv4,
 };
 use anyhow::{Context, Result, ensure};
@@ -62,11 +62,15 @@ async fn send_packets(
     let mut packets = vec![vec![0u8; 65535]; batch_size];
     let mut sizes = vec![0; batch_size];
     let mut sequence = 0u64;
+    let mut fec = FecSender::default();
     loop {
-        let count = device
-            .recv_multiple(&mut original, &mut packets, &mut sizes, 0)
-            .await
-            .context("批量读取 TUN 失败")?;
+        let deadline = fec.deadline();
+        let count = tokio::select! {
+            result = device.recv_multiple(&mut original, &mut packets, &mut sizes, 0) => result.context("批量读取 TUN 失败")?,
+            _ = tokio::time::sleep_until(deadline.unwrap_or_else(std::time::Instant::now).into()), if deadline.is_some() => {
+                fec.flush(&active,shared); continue;
+            }
+        };
         for i in 0..count {
             let packet = &packets[i][..sizes[i]];
             if !valid_ipv4(
@@ -85,7 +89,13 @@ async fn send_packets(
             data.push(3);
             data.extend_from_slice(&sequence.to_be_bytes());
             data.extend_from_slice(packet);
-            if replicate(data.into(), &mut active, shared).await {
+            if fec
+                .deadline()
+                .is_some_and(|t| t <= std::time::Instant::now())
+            {
+                fec.flush(&active, shared);
+            }
+            if fec.send(data.into(), &mut active, shared).await {
                 shared.counters(|c| {
                     c.tx_packets += 1;
                     c.tx_bytes += packet.len() as u64;

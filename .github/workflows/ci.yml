@@ -43,6 +43,10 @@ jobs:
           exit "$failed"
       - name: 互斥端点组、故障降级与恢复
         run: sudo env QUICWIRE_TEST_EXCLUSIVE=true QUICWIRE_TEST_SELECTION_POLICY=hybrid bash scripts/linux-smoke.sh target/release/quicwire
+      - name: FEC 双向恢复、内容校验与有损网络
+        run: |
+          sudo env QUICWIRE_TEST_FEC=1 QUICWIRE_TEST_SELECTION_POLICY=hybrid bash scripts/linux-smoke.sh target/release/quicwire
+          sudo env QUICWIRE_TEST_FEC=2 QUICWIRE_TEST_SELECTION_POLICY=hybrid bash scripts/linux-smoke.sh target/release/quicwire
       - name: 保存 Linux 测试构建
         uses: actions/upload-artifact@v7.0.1
         with:

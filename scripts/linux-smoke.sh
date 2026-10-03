@@ -72,7 +72,7 @@ wait_connected() {
   done
   echo '隧道未在限定时间恢复' >&2; return 1
 }
-if [[ "${QUICWIRE_TEST_MULTIPATH:-false}" == true ]]; then
+if [[ "${QUICWIRE_TEST_MULTIPATH:-false}" == true || "${QUICWIRE_TEST_FEC:-0}" != 0 ]]; then
   sed -i 's/bind = "192.0.2.1:4433"/listen = ["192.0.2.1:4433-4436"]/' "$work/server.toml"
   sed -i 's/endpoint = "192.0.2.1:4433"/endpoints = ["192.0.2.1:4433-4436"]/' "$work/client.toml"
   cat >> "$work/client.toml" <<EOF_MP
@@ -80,6 +80,10 @@ max_sessions = 4
 active_sessions = 2
 standby_rotate_secs = 5
 EOF_MP
+fi
+if [[ "${QUICWIRE_TEST_FEC:-0}" != 0 ]]; then
+  echo "fec = ${QUICWIRE_TEST_FEC}" >> "$work/server.toml"
+  echo "fec = ${QUICWIRE_TEST_FEC}" >> "$work/client.toml"
 fi
 if [[ "${QUICWIRE_TEST_EXCLUSIVE:-false}" == true ]]; then
   python3 "$script_dir/exclusive-check.py" "$binary" "$server_ns" "$client_ns" "$work"
@@ -121,6 +125,9 @@ for side in server client; do
   wait "$payload_pid"
   payload_pid=''
 done
+if [[ "${QUICWIRE_TEST_FEC:-0}" != 0 ]]; then
+  python3 "$script_dir/fec-check.py" "$binary" "$server_ns" "$client_ns" "$work"
+fi
 kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=''

@@ -271,6 +271,18 @@ fn render(v: &serde_json::Value, verbose: bool) -> String {
         count(&c["tx_copies"])
     );
     out.push_str("  有效接收＝校验、去重后成功入队；业务发送＝至少一条路径成功入队。\n");
+    if v["fec"].as_u64().unwrap_or(0) > 0 {
+        let _ = writeln!(
+            out,
+            "  FEC{} XOR(4+1) / 5 ms：校验发送 {}  收到 {}  恢复 {}  未恢复过期组 {}  校验队列丢弃 {}",
+            count(&v["fec"]),
+            count(&c["fec_tx_packets"]),
+            count(&c["fec_rx_packets"]),
+            count(&c["fec_recovered_packets"]),
+            count(&v["fec_expired_groups"]),
+            count(&c["fec_queue_drops"])
+        );
+    }
     out.push_str("\n路径（激活优先；计数从各会话建立起累计）\n");
     let mut paths: Vec<_> = v["paths"]
         .as_array()

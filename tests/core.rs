@@ -30,6 +30,7 @@ fn config(mode: Mode, peer: &PublicKey) -> Config {
         peer_address: format!("10.77.0.{remote}").parse().unwrap(),
         mtu: 1100,
         tun_offload: true,
+        fec: 0,
     }
 }
 
