@@ -80,6 +80,10 @@ active_sessions = 2
 standby_rotate_secs = 5
 EOF_MP
 fi
+if [[ "${QUICWIRE_TEST_LIFECYCLE:-false}" == true ]]; then
+  python3 "$script_dir/lifecycle-check.py" "$binary" "$server_ns" "$client_ns" "$work"
+  exit 0
+fi
 start_server
 ip netns exec "$client_ns" "$binary" run --config "$work/client.toml" > "$work/client.log" 2>&1 &
 client_pid=$!

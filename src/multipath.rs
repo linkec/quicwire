@@ -103,6 +103,7 @@ pub struct Counters {
 }
 struct Path {
     id: u64,
+    slot: usize,
     local: SocketAddr,
     remote: SocketAddr,
     connection: Connection,
@@ -157,6 +158,12 @@ struct State {
     started: Instant,
     failures: u64,
     latest_error: Option<String>,
+    startup_pending: bool,
+    selection_started: Instant,
+    reserved: Vec<u64>,
+    retiring: Option<u64>,
+    ttl_rotations: u64,
+    ttl_waiting_reason: Option<String>,
 }
 pub struct Shared {
     state: Mutex<State>,
@@ -189,6 +196,11 @@ pub struct PathStatus {
     pub rx_copies: u64,
     pub rx_bytes: u64,
     pub queue_drops: u64,
+    pub score: f64,
+    pub slot: Option<usize>,
+    pub reserved: bool,
+    pub retiring: bool,
+    pub ttl_remaining_secs: Option<u64>,
 }
 #[derive(Serialize)]
 pub struct Status {
@@ -212,6 +224,14 @@ pub struct Status {
     pub tun_rx_dropped: Option<u64>,
     pub counters: Counters,
     pub paths: Vec<PathStatus>,
+    pub switch_threshold_percent: Option<f64>,
+    pub stable_session_ttl_secs: Option<u64>,
+    pub reserve_sessions: Option<usize>,
+    pub reserved: usize,
+    pub startup_pending: bool,
+    pub ttl_rotations: u64,
+    pub ttl_waiting_reason: Option<String>,
+    pub ttl_degradation_percent: Option<f64>,
 }
 
 fn tun_stat(name: &str, counter: &str) -> Option<u64> {
@@ -275,6 +295,18 @@ impl Shared {
                     rx_copies: p.rx_copies,
                     rx_bytes: p.rx_bytes,
                     queue_drops: p.queue_drops,
+                    score: p.score(),
+                    slot: (self.config.mode == Mode::Client).then_some(p.slot),
+                    reserved: s.reserved.contains(&p.id),
+                    retiring: s.retiring == Some(p.id),
+                    ttl_remaining_secs: (self.config.mode == Mode::Client
+                        && self.config.stable_session_ttl_secs != 0
+                        && (s.active.contains(&p.id) || s.reserved.contains(&p.id)))
+                    .then(|| {
+                        self.config
+                            .stable_session_ttl_secs
+                            .saturating_sub(p.connected.elapsed().as_secs())
+                    }),
                 }
             })
             .collect();
@@ -313,6 +345,18 @@ impl Shared {
             tun_rx_dropped: tun_stat(&self.config.tun_name, "rx_dropped"),
             counters: s.counters.clone(),
             paths,
+            switch_threshold_percent: (self.config.mode == Mode::Client)
+                .then_some(self.config.switch_threshold_percent),
+            stable_session_ttl_secs: (self.config.mode == Mode::Client)
+                .then_some(self.config.stable_session_ttl_secs),
+            reserve_sessions: (self.config.mode == Mode::Client)
+                .then_some(self.config.reserve_sessions),
+            reserved: s.reserved.len(),
+            startup_pending: s.startup_pending,
+            ttl_rotations: s.ttl_rotations,
+            ttl_waiting_reason: s.ttl_waiting_reason.clone(),
+            ttl_degradation_percent: (self.config.mode == Mode::Client)
+                .then_some(self.config.ttl_degradation_percent),
         }
     }
     fn publish(&self, s: &State) {
@@ -346,11 +390,12 @@ impl Shared {
     fn tick(&self) {
         let now = Instant::now();
         let mut s = self.state.lock().unwrap();
+        let ttl = Duration::from_secs(self.config.stable_session_ttl_secs);
         if self.config.mode == Mode::Client {
             let mut candidates: Vec<_> = s
                 .paths
                 .values()
-                .filter(|p| p.healthy(now))
+                .filter(|p| p.healthy(now) && !p.rotating)
                 .map(|p| (p.id, p.score()))
                 .collect();
             candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
@@ -358,58 +403,138 @@ impl Shared {
                 .active
                 .iter()
                 .copied()
-                .filter(|id| s.paths.get(id).is_some_and(|p| p.healthy(now)))
+                .filter(|id| {
+                    s.paths
+                        .get(id)
+                        .is_some_and(|p| p.healthy(now) && !p.rotating)
+                })
                 .collect();
             let mut next = valid.clone();
-            for (id, _) in &candidates {
-                if next.len() >= s.configured_active {
-                    break;
-                }
-                if !next.contains(id) {
-                    next.push(*id);
-                }
-            }
-            let best: Vec<_> = candidates
-                .iter()
-                .take(s.configured_active)
-                .map(|p| p.0)
-                .collect();
-            if next == s.active
-                && !best.is_empty()
-                && now.duration_since(s.last_switch) >= Duration::from_secs(5)
-            {
-                let old_score: f64 = next.iter().map(|id| s.paths[id].score()).sum();
-                let pending = s.challenger.clone().filter(|(ids, _)| {
-                    ids.len() == s.configured_active
-                        && ids
-                            .iter()
-                            .all(|id| s.paths.get(id).is_some_and(|p| p.healthy(now)))
-                        && ids.iter().map(|id| s.paths[id].score()).sum::<f64>() < old_score * 0.8
-                });
-                if let Some((ids, since)) = pending {
-                    // 同级备用的排序波动不能把一个持续合格候选的观察计时反复清零。
-                    if now.duration_since(since) >= Duration::from_secs(3) {
-                        next = ids;
-                    }
-                } else if best != next
-                    && best.iter().map(|id| s.paths[id].score()).sum::<f64>() < old_score * 0.8
+            let mut reason = if valid.len() < s.active.len() {
+                "故障路径替换"
+            } else {
+                "补充健康路径"
+            };
+            s.ttl_waiting_reason = None;
+            if s.startup_pending {
+                let mut ordered: Vec<_> = candidates
+                    .iter()
+                    .map(|(id, _)| (*id, s.paths[id].slot))
+                    .collect();
+                ordered.sort_by_key(|p| p.1);
+                let expected = s
+                    .configured_active
+                    .min(self.config.remote_addresses().map(|a| a.len()).unwrap_or(0));
+                let initial_ready =
+                    (0..expected).all(|slot| ordered.iter().any(|(_, i)| *i == slot));
+                if initial_ready
+                    || now.duration_since(s.selection_started) >= transport::HANDSHAKE_TIMEOUT
                 {
-                    s.challenger = Some((best, now));
+                    next = ordered
+                        .into_iter()
+                        .take(s.configured_active)
+                        .map(|p| p.0)
+                        .collect();
+                    if !next.is_empty() {
+                        s.startup_pending = false;
+                    }
+                    reason = "启动按配置顺序激活";
+                }
+            } else {
+                for (id, _) in &candidates {
+                    if next.len() >= s.configured_active {
+                        break;
+                    }
+                    if !next.contains(id) {
+                        next.push(*id);
+                    }
+                }
+                let best: Vec<_> = candidates
+                    .iter()
+                    .take(s.configured_active)
+                    .map(|p| p.0)
+                    .collect();
+                if next == s.active
+                    && !best.is_empty()
+                    && s.retiring.is_none()
+                    && now.duration_since(s.last_switch) >= Duration::from_secs(5)
+                {
+                    let old_score: f64 = next.iter().map(|id| s.paths[id].score()).sum();
+                    let qualifies = |ids: &[u64]| {
+                        ids.len() == s.configured_active
+                            && ids.iter().all(|id| {
+                                s.paths
+                                    .get(id)
+                                    .is_some_and(|p| p.healthy(now) && !p.rotating)
+                            })
+                            && score_improves(
+                                old_score,
+                                ids.iter().map(|id| s.paths[id].score()).sum(),
+                                self.config.switch_threshold_percent,
+                            )
+                    };
+                    let pending = s.challenger.clone().filter(|(ids, _)| qualifies(ids));
+                    if let Some((ids, since)) = pending {
+                        if now.duration_since(since) >= Duration::from_secs(3) {
+                            next = ids;
+                            reason = "备用路径质量持续改善";
+                        }
+                    } else if best != next && qualifies(&best) {
+                        s.challenger = Some((best, now));
+                    } else {
+                        s.challenger = None;
+                    }
                 } else {
                     s.challenger = None;
                 }
-            } else {
-                s.challenger = None;
+                // TTL 是软期限：先检查质量，再选备用接替；旧连接保留至对端确认。
+                if next == s.active
+                    && s.retiring.is_none()
+                    && !ttl.is_zero()
+                    && now.duration_since(s.last_rotation) >= Duration::from_secs(2)
+                {
+                    let mut expired: Vec<_> = next
+                        .iter()
+                        .copied()
+                        .filter(|id| now.duration_since(s.paths[id].connected) >= ttl)
+                        .collect();
+                    expired.sort_by_key(|id| s.paths[id].connected);
+                    if !expired.is_empty() {
+                        let replacement = candidates.iter().find(|(id, _)| {
+                            !next.contains(id)
+                                && now.duration_since(s.paths[id].connected)
+                                    >= Duration::from_secs(3)
+                        });
+                        match replacement {
+                            Some((new, score)) => {
+                                if let Some(old) = expired.into_iter().find(|id| {
+                                    ttl_degraded(
+                                        s.paths[id].score(),
+                                        *score,
+                                        self.config.ttl_degradation_percent,
+                                    )
+                                }) {
+                                    let pos = next.iter().position(|id| *id == old).unwrap();
+                                    next[pos] = *new;
+                                    s.retiring = Some(old);
+                                    reason = "TTL 到期且质量劣化，备用接替";
+                                } else {
+                                    s.ttl_waiting_reason = Some(
+                                        "TTL 到期，质量劣化未达门槛，继续使用并定期复查".into(),
+                                    );
+                                }
+                            }
+                            None => {
+                                s.ttl_waiting_reason = Some(
+                                    "TTL 到期，缺少经过至少 3 秒观察的健康备用，延后轮换".into(),
+                                )
+                            }
+                        }
+                    }
+                }
             }
             if next != s.active {
-                s.reason = if valid.len() < s.active.len() {
-                    "故障路径替换"
-                } else if next.len() > s.active.len() {
-                    "补充健康路径"
-                } else {
-                    "备用路径质量持续改善"
-                }
-                .into();
+                s.reason = reason.into();
                 s.active = next;
                 s.generation = s.generation.checked_add(1).expect("控制版本耗尽");
                 s.switches += 1;
@@ -420,8 +545,51 @@ impl Shared {
                     s.generation, s.active, s.reason
                 );
             }
+            if let Some(old) = s.retiring {
+                if s.active.contains(&old) || !s.paths.contains_key(&old) {
+                    // 新路径失效时允许回退至尚未关闭的旧路径。
+                    s.retiring = None;
+                } else {
+                    let all_ready = s.active.len() == s.configured_active
+                        && s.active
+                            .iter()
+                            .all(|id| s.paths.get(id).is_some_and(|p| p.healthy(now)));
+                    let confirmed = s.active.iter().any(|id| {
+                        s.paths
+                            .get(id)
+                            .is_some_and(|p| p.acked_generation >= s.generation)
+                    });
+                    if all_ready && confirmed {
+                        let p = s.paths.get_mut(&old).unwrap();
+                        p.rotating = true;
+                        p.connection.close(0x300u32.into(), b"stable TTL rotation");
+                        s.rotations += 1;
+                        s.ttl_rotations += 1;
+                        s.last_rotation = now;
+                        s.retiring = None;
+                    } else {
+                        s.ttl_waiting_reason = Some("等待服务端确认接替，保留旧连接".into());
+                    }
+                }
+            }
+            s.reserved = candidates
+                .iter()
+                .filter(|(id, _)| {
+                    !s.active.contains(id)
+                        && s.retiring != Some(*id)
+                        && s.paths.get(id).is_some_and(|p| !p.rotating)
+                })
+                .take(self.config.reserve_sessions)
+                .map(|p| p.0)
+                .collect();
         }
+        let active = s.active.clone();
         for p in s.paths.values_mut() {
+            if active.contains(&p.id) {
+                p.standby_since = None;
+            } else if p.standby_since.is_none() {
+                p.standby_since = Some(now);
+            }
             let secs = now.duration_since(p.rate_sample.0).as_secs_f64();
             if secs >= 1.0 {
                 p.tx_bps = (p.tx_bytes - p.rate_sample.1) as f64 * 8.0 / secs;
@@ -429,50 +597,72 @@ impl Shared {
                 p.rate_sample = (now, p.tx_bytes, p.rx_bytes);
             }
         }
+        if self.config.mode == Mode::Client
+            && s.retiring.is_none()
+            && now.duration_since(s.last_rotation) >= Duration::from_secs(2)
         {
-            let active = s.active.clone();
-            for p in s.paths.values_mut() {
-                if active.contains(&p.id) {
-                    p.standby_since = None;
-                } else if p.standby_since.is_none() {
-                    p.standby_since = Some(now);
-                }
-            }
-        }
-        if self.config.mode == Mode::Client {
-            let active = s.active.clone();
-            let age = Duration::from_secs(self.config.standby_rotate_secs);
-            if !age.is_zero() && now.duration_since(s.last_rotation) >= Duration::from_secs(2) {
-                let rotate = s
-                    .paths
-                    .values()
-                    .filter(|p| {
-                        !p.rotating
-                            && !active.contains(&p.id)
-                            && !s
-                                .challenger
-                                .as_ref()
-                                .is_some_and(|(ids, _)| ids.contains(&p.id))
-                    })
-                    .filter_map(|p| {
+            let standby_age = Duration::from_secs(self.config.standby_rotate_secs);
+            let rotate = s
+                .paths
+                .values()
+                .filter(|p| !p.rotating && !active.contains(&p.id))
+                .filter(|p| {
+                    !s.challenger
+                        .as_ref()
+                        .is_some_and(|(ids, _)| ids.contains(&p.id))
+                })
+                .filter_map(|p| {
+                    if s.reserved.contains(&p.id) {
+                        // 最快候选保留跨越普通备用周期；TTL 到期后仅在质量明显落后时重采样。
+                        let best_other = s
+                            .paths
+                            .values()
+                            .filter(|other| {
+                                other.id != p.id
+                                    && !active.contains(&other.id)
+                                    && other.healthy(now)
+                                    && !other.rotating
+                            })
+                            .map(Path::score)
+                            .min_by(f64::total_cmp);
+                        (!ttl.is_zero()
+                            && now.duration_since(p.connected) >= ttl
+                            && best_other.is_some_and(|score| {
+                                ttl_degraded(p.score(), score, self.config.ttl_degradation_percent)
+                            }))
+                        .then_some((p.id, p.connected, true))
+                    } else {
                         p.standby_since
-                            .filter(|t| now.duration_since(*t) >= age)
-                            .map(|t| (p.id, t))
-                    })
-                    .min_by_key(|p| p.1)
-                    .map(|p| p.0);
-                if let Some(id) = rotate {
-                    let p = s.paths.get_mut(&id).unwrap();
-                    p.rotating = true;
-                    p.connection.close(0x300u32.into(), b"standby rotation");
-                    s.rotations += 1;
-                    s.last_rotation = now;
-                    eprintln!("备用路径到龄轮转 id={id:016x}，重新分配 UDP 源端口");
+                            .filter(|t| {
+                                !standby_age.is_zero() && now.duration_since(*t) >= standby_age
+                            })
+                            .map(|t| (p.id, t, false))
+                    }
+                })
+                .min_by_key(|p| p.1);
+            if let Some((id, _, stable)) = rotate {
+                let p = s.paths.get_mut(&id).unwrap();
+                p.rotating = true;
+                p.connection.close(0x300u32.into(), b"standby rotation");
+                s.reserved.retain(|p| *p != id);
+                s.rotations += 1;
+                if stable {
+                    s.ttl_rotations += 1;
                 }
+                s.last_rotation = now;
+                eprintln!("备用路径轮转 id={id:016x} stable={stable}，重新分配 UDP 源端口");
             }
         }
         self.publish(&s);
     }
+}
+
+fn score_improves(current: f64, candidate: f64, threshold: f64) -> bool {
+    candidate < current * (1.0 - threshold / 100.0)
+}
+fn ttl_degraded(current: f64, reference: f64, threshold: f64) -> bool {
+    threshold == 0.0
+        || (current > reference && current - reference >= reference * threshold / 100.0)
 }
 
 pub struct Multipath {
@@ -587,6 +777,12 @@ impl Multipath {
                 started: now,
                 failures: 0,
                 latest_error: None,
+                startup_pending: config.mode == Mode::Client,
+                selection_started: now,
+                reserved: Vec::new(),
+                retiring: None,
+                ttl_rotations: 0,
+                ttl_waiting_reason: None,
             }),
         });
         let task_shared = shared.clone();
@@ -660,6 +856,7 @@ async fn manage(
                                 cfg,
                                 shared.clone(),
                                 incoming.clone(),
+                                slot,
                             )
                             .await
                         }
@@ -699,7 +896,7 @@ async fn manage(
                             let config=config.clone();let shared=shared.clone();let incoming=incoming.clone();let local=endpoint.local_addr()?;
                             peers.spawn(async move {
                                 let _permit=permit;
-                                let result=async {let conn=tokio::time::timeout(transport::HANDSHAKE_TIMEOUT,next).await.context("QUIC 握手超时")??;connected(conn,local,config,shared.clone(),incoming).await}.await;
+                                let result=async {let conn=tokio::time::timeout(transport::HANDSHAKE_TIMEOUT,next).await.context("QUIC 握手超时")??;connected(conn,local,config,shared.clone(),incoming,0).await}.await;
                                 if let Err(e)=result {shared.failed(&e);}
                             });
                         },
@@ -767,6 +964,11 @@ fn bind_group(shared: &Shared, peer: Epoch, max: usize, active: usize) -> Result
         s.generation = 0;
         s.dedup = Dedup::default();
         s.challenger = None;
+        s.startup_pending = shared.config.mode == Mode::Client;
+        s.selection_started = now;
+        s.reserved.clear();
+        s.retiring = None;
+        s.ttl_waiting_reason = None;
         if shared.config.mode == Mode::Server {
             s.client_epoch = Some(peer);
         } else {
@@ -789,6 +991,7 @@ async fn connected(
     config: Config,
     shared: Arc<Shared>,
     incoming: mpsc::Sender<Bytes>,
+    slot: usize,
 ) -> Result<()> {
     let mut session = http3::negotiate_multipath(&conn, &config).await?;
     let client = config.mode == Mode::Client;
@@ -827,6 +1030,7 @@ async fn connected(
             id,
             Path {
                 id,
+                slot,
                 local,
                 remote: conn.remote_address(),
                 connection: conn.clone(),
@@ -1279,6 +1483,144 @@ mod tests {
         assert_eq!(d.insert(u64::MAX), Verdict::Duplicate);
     }
     #[test]
+    fn configurable_score_and_ttl_threshold_boundaries() {
+        assert!(!score_improves(145.0, 135.0, 20.0));
+        assert!(score_improves(145.0, 135.0, 5.0));
+        assert!(!score_improves(100.0, 95.0, 5.0));
+        assert!(!score_improves(100.0, 100.0, 0.0));
+        assert!(ttl_degraded(110.0, 100.0, 10.0));
+        assert!(!ttl_degraded(109.9, 100.0, 10.0));
+        assert!(!ttl_degraded(95.0, 100.0, 10.0));
+        assert!(ttl_degraded(95.0, 100.0, 0.0));
+        assert!(!ttl_degraded(0.0, 0.0, 10.0));
+    }
+
+    #[tokio::test]
+    async fn ordered_start_reservation_ttl_deferral_and_acknowledged_handover() {
+        let (sid, _) = Identity::generate().unwrap();
+        let (cid, _) = Identity::generate().unwrap();
+        let port = free_ports();
+        let mut sc = config(Mode::Server, &cid.public, port);
+        sc.bind = "0.0.0.0:0".parse().unwrap();
+        sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
+        let mut cc = config(Mode::Client, &sid.public, port);
+        cc.endpoints = sc.listen.clone();
+        cc.max_sessions = 3;
+        cc.active_sessions = 1;
+        cc.standby_rotate_secs = 5;
+        cc.stable_session_ttl_secs = 5;
+        cc.switch_threshold_percent = 99.0;
+        let mut server = Multipath::start(sc, sid).unwrap();
+        let mut client = Multipath::start(cc, cid).unwrap();
+        until(|| client.shared.snapshot().healthy == 3 && server.shared.snapshot().active == 1)
+            .await;
+        let (old, reserve, old_port) = {
+            let mut s = client.shared.state.lock().unwrap();
+            let old = s.active[0];
+            assert_eq!(s.paths[&old].slot, 0, "启动必须选配置第一条，而非最低评分");
+            let reserve = s.paths.values().find(|p| p.slot == 1).unwrap().id;
+            let old_port = s.paths[&old].local.port();
+            let now = Instant::now();
+            s.last_rotation = now - Duration::from_secs(3);
+            for p in s.paths.values_mut() {
+                p.connected = now - Duration::from_secs(6);
+                p.standby_since = Some(now - Duration::from_secs(6));
+                p.seen = Some(now);
+                p.rtt = if p.id == old {
+                    100.0
+                } else if p.id == reserve {
+                    95.0
+                } else {
+                    120.0
+                };
+                p.jitter = 0.0;
+                p.recent_loss = 0.0;
+            }
+            (old, reserve, old_port)
+        };
+        {
+            let mut s = client.shared.state.lock().unwrap();
+            for p in s.paths.values_mut().filter(|p| p.id != old) {
+                p.seen = None;
+                p.standby_since = Some(Instant::now());
+            }
+        }
+        client.shared.tick();
+        {
+            let mut s = client.shared.state.lock().unwrap();
+            assert_eq!(s.active, vec![old], "没有健康备用时必须延后 TTL");
+            assert!(s.paths[&old].connection.close_reason().is_none());
+            assert!(s.ttl_waiting_reason.as_ref().unwrap().contains("缺少"));
+            for p in s.paths.values_mut().filter(|p| p.id != old) {
+                p.seen = Some(Instant::now());
+                p.standby_since = Some(Instant::now() - Duration::from_secs(6));
+            }
+        }
+        client.shared.tick();
+        {
+            let mut s = client.shared.state.lock().unwrap();
+            assert_eq!(s.active, vec![old], "TTL 到期但劣化不达 10% 时不能切换");
+            assert!(s.reserved.contains(&reserve));
+            assert!(
+                !s.paths[&reserve].rotating,
+                "更快预留候选不能按普通备用周期丢弃"
+            );
+            assert!(s.ttl_waiting_reason.as_ref().unwrap().contains("未达门槛"));
+            s.paths.get_mut(&old).unwrap().rtt = 110.0;
+            s.last_rotation = Instant::now() - Duration::from_secs(3);
+        }
+        client.shared.tick();
+        {
+            let s = client.shared.state.lock().unwrap();
+            assert_eq!(s.active, vec![reserve]);
+            assert_eq!(s.retiring, Some(old));
+            assert!(
+                s.paths[&old].connection.close_reason().is_none(),
+                "对端未确认前不能断开旧会话"
+            );
+        }
+        until(|| {
+            let s = client.shared.state.lock().unwrap();
+            s.ttl_rotations >= 1
+                && !s.paths.contains_key(&old)
+                && s.paths
+                    .values()
+                    .any(|p| p.slot == 0 && p.healthy(Instant::now()))
+        })
+        .await;
+        assert_ne!(
+            client
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .values()
+                .find(|p| p.slot == 0)
+                .unwrap()
+                .local
+                .port(),
+            old_port
+        );
+        assert!(
+            replicate(
+                packet(1, false),
+                &mut client.selected.clone(),
+                &client.shared
+            )
+            .await
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), server.received.recv())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[test]
     fn ranges_limits_and_rotation_validation() {
         use crate::config::expand_addresses;
         assert_eq!(
@@ -1302,6 +1644,23 @@ mod tests {
         cfg.endpoints = vec!["192.0.2.1:4433-4435".into(), "192.0.2.2:4433".into()];
         cfg.max_sessions = 3;
         cfg.active_sessions = 2;
+        assert!(cfg.validate().is_ok());
+        for threshold in [-1.0, 100.0, f64::NAN, f64::INFINITY] {
+            cfg.switch_threshold_percent = threshold;
+            assert!(cfg.validate().is_err());
+        }
+        cfg.switch_threshold_percent = 5.0;
+        for threshold in [-1.0, 1001.0, f64::NAN] {
+            cfg.ttl_degradation_percent = threshold;
+            assert!(cfg.validate().is_err());
+        }
+        cfg.ttl_degradation_percent = 10.0;
+        cfg.stable_session_ttl_secs = 4;
+        assert!(cfg.validate().is_err());
+        cfg.stable_session_ttl_secs = 300;
+        cfg.reserve_sessions = 33;
+        assert!(cfg.validate().is_err());
+        cfg.reserve_sessions = 1;
         assert!(cfg.validate().is_ok());
         assert_eq!(
             cfg.remote_addresses().unwrap()[1].ip().to_string(),
@@ -1333,6 +1692,7 @@ mod tests {
         cc.max_sessions = 3;
         cc.active_sessions = 2;
         cc.standby_rotate_secs = 5;
+        cc.reserve_sessions = 0;
         let mut server = Multipath::start(sc.clone(), clone_identity(&sid)).unwrap();
         let mut client = Multipath::start(cc, clone_identity(&cid)).unwrap();
         until(|| {
