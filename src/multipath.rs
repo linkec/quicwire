@@ -1449,12 +1449,7 @@ struct PathReceiver<'a> {
 }
 impl PathReceiver<'_> {
     fn deliver(&self, sequence: u64, packet: Bytes, recovered: bool) {
-        if !valid_ipv4(
-            &packet,
-            self.config.peer_address,
-            self.config.tun_address.addr(),
-            self.config.mtu,
-        ) {
+        if !valid_ipv4(&packet, self.config.mtu) {
             self.shared.counters(|c| c.invalid += 1);
             return;
         }
@@ -1579,12 +1574,7 @@ impl PathReceiver<'_> {
                     packet,
                 } = &frame
                 {
-                    if !valid_ipv4(
-                        packet,
-                        self.config.peer_address,
-                        self.config.tun_address.addr(),
-                        self.config.mtu,
-                    ) {
+                    if !valid_ipv4(packet, self.config.mtu) {
                         self.shared.counters(|c| c.invalid += 1);
                         return Ok(());
                     }
@@ -2541,7 +2531,7 @@ mod tests {
         );
         let mut selected = client.selected.clone();
         let mut invalid = packet(1, false).to_vec();
-        invalid[21] = 192;
+        invalid[9] = 0x65; // 非 IPv4 包仍必须拒绝，地址变化本身允许。
         assert!(replicate(invalid.into(), &mut selected, &client.shared).await);
         until(|| server.shared.snapshot().counters.invalid == 1).await;
         assert_eq!(server.shared.snapshot().counters.rx_effective_packets, 0);
@@ -2636,7 +2626,7 @@ mod tests {
         until(|| client.shared.snapshot().counters.duplicates == 1).await;
         // 无效包的大序号不能污染去重窗口。
         let mut invalid = packet(u64::MAX, false).to_vec();
-        invalid[21] = 192;
+        invalid[9] = 0x65; // 非 IPv4 包仍必须拒绝，地址变化本身允许。
         let mut selected = client.selected.clone();
         assert!(replicate(invalid.into(), &mut selected, &client.shared).await);
         assert!(replicate(packet(2, false), &mut selected, &client.shared).await);
@@ -2769,7 +2759,16 @@ mod tests {
                 let mut frames = Vec::new();
                 let mut repair = None;
                 for seq in 1..=4 {
-                    let p = packet(seq, reverse);
+                    let mut p = packet(seq, reverse).to_vec();
+                    // 跨网段原始包和校验恢复包都必须允许非 TUN 端点的地址。
+                    let (src, dst) = if reverse {
+                        ([198, 51, 100, 7], [192, 168, 8, 9])
+                    } else {
+                        ([192, 168, 8, 9], [198, 51, 100, 7])
+                    };
+                    p[21..25].copy_from_slice(&src);
+                    p[25..29].copy_from_slice(&dst);
+                    let p = Bytes::from(p);
                     frames.push(e.data(seq, &p[9..]));
                     repair = e.push(seq, p.slice(9..), Instant::now());
                 }

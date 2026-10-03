@@ -247,7 +247,7 @@ fn reject_unsafe_config() {
 }
 
 #[test]
-fn packet_validation_rejects_spoofing_truncation_and_ipv6() {
+fn packet_validation_allows_routing_but_rejects_truncation_and_ipv6() {
     let source: Ipv4Addr = "10.77.0.1".parse().unwrap();
     let dest: Ipv4Addr = "10.77.0.2".parse().unwrap();
     let mut packet = vec![0; 64];
@@ -255,15 +255,16 @@ fn packet_validation_rejects_spoofing_truncation_and_ipv6() {
     packet[2..4].copy_from_slice(&64_u16.to_be_bytes());
     packet[12..16].copy_from_slice(&source.octets());
     packet[16..20].copy_from_slice(&dest.octets());
-    assert!(valid_ipv4(&packet, source, dest, 1100));
-    assert!(!valid_ipv4(&packet, dest, source, 1100));
-    assert!(!valid_ipv4(&packet[..63], source, dest, 1100));
-    assert!(!valid_ipv4(&packet, source, dest, 60));
+    assert!(valid_ipv4(&packet, 1100));
+    packet[16..20].copy_from_slice(&[198, 51, 100, 7]);
+    assert!(valid_ipv4(&packet, 1100));
+    assert!(!valid_ipv4(&packet[..63], 1100));
+    assert!(!valid_ipv4(&packet, 60));
     packet[0] = 0x65;
-    assert!(!valid_ipv4(&packet, source, dest, 1100));
+    assert!(!valid_ipv4(&packet, 1100));
     packet[0] = 0x44;
-    assert!(!valid_ipv4(&packet, source, dest, 1100));
-    assert!(!valid_ipv4(&[], source, dest, 1100));
+    assert!(!valid_ipv4(&packet, 1100));
+    assert!(!valid_ipv4(&[], 1100));
 }
 
 #[cfg(target_os = "linux")]

@@ -6,7 +6,7 @@
 
 Linux 客户端和服务端，各一个 TUN、一个授权 peer，多条独立 QUIC/H3 连接承载同一个逻辑隧道。内层只支持 IPv4，两端主机可以通过隧道地址双向使用 ICMP、TCP 和 UDP。外层 endpoint 使用 IP 字面量，不做 DNS 解析；可选 server_name 仅用于 TLS SNI 与 HTTP authority。macOS 可生成密钥、校验配置和执行协议测试，尚无 TUN 数据面。
 
-程序只创建自己的 TUN 和对应连接路由，退出关闭 TUN fd 后由内核删除。已有同名接口会被拒绝。需要自行选择未被其他业务使用的隧道网段。程序不修改默认路由、DNS、NAT、防火墙或 IP forwarding。不支持经隧道转发第三方子网、多 peer、IPv6 内层或面向未授权浏览器的普通网站服务。
+程序只创建自己的 TUN 和对应连接路由，退出关闭 TUN fd 后由内核删除。已有同名接口会被拒绝。需要自行选择未被其他业务使用的隧道网段。程序不修改默认路由、DNS、NAT、防火墙或 IP forwarding。从 0.3.10 起支持经隧道转发第三方 IPv4 子网和 NAT 回程，需由 Linux 配置路由、转发及访问控制，见 [IPv4 路由与 NAT](routing.md)。不支持多 peer、IPv6 内层或面向未授权浏览器的普通网站服务。
 
 ## 构建与运行
 
@@ -63,7 +63,7 @@ sudo journalctl -u quicwire -f
 
 HTTP/3 控制流与 QPACK 由 h3 库维护。客户端使用 Extended CONNECT，请求头携带 `:protocol=quicwire`、`capsule-protocol: ?1` 和版本 3。双方通过加密头核对静态地址和 MTU，成功后再用已认证数据通道绑定运行代际和路径 ID。请求流在路径整个生命周期保持打开。
 
-原始 IPv4 包前增加 64 位序号，同一个包复制到 K 条激活路径。接收端跨路径去重后写入 TUN；所有方向仍校验 IP 长度、来源、目的和 MTU。仅允许配置的两个隧道主机地址。去重帧属于私有 H3 扩展协议，不能当作 RFC 9484 的裸 IP 数据格式。
+原始 IPv4 包前增加 64 位序号，同一个包复制到 K 条激活路径。接收端跨路径去重后写入 TUN；所有方向统一校验 IPv4 版本、头长度、总长度和 MTU。内层源地址和目的地址不再限制为两个 TUN 端点，访问范围交给 Linux 防火墙控制。去重帧属于私有 H3 扩展协议，不能当作 RFC 9484 的裸 IP 数据格式。
 
 外层 UDP payload 固定初始及最小大小 1200，关闭路径 MTU 探测；内层 MTU 1100 留出 QUIC 开销。路径必须承载标准 QUIC 最小 UDP payload。运行前检查协商后的 DATAGRAM 容量足够。
 

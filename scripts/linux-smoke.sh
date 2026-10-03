@@ -132,6 +132,7 @@ for side in server client; do
   wait "$payload_pid"
   payload_pid=''
 done
+python3 "$script_dir/routing-check.py" "$server_ns" "$client_ns" "$work"
 if [[ "${QUICWIRE_TEST_FEC:-0}" != 0 ]]; then
   python3 "$script_dir/fec-check.py" "$binary" "$server_ns" "$client_ns" "$work"
 fi

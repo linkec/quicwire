@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """在独立网络 namespace 中校验 TCP 大写入和 UDP 分片的数据完整性。"""
 import pathlib
+import os
 import socket
 import sys
 
@@ -30,6 +31,9 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp, socket.socket(soc
         udp.bind((address, port))
         pathlib.Path(sys.argv[3]).write_text("ready")
         with tcp.accept()[0] as conn:
+            expected = os.environ.get('QUICWIRE_TEST_EXPECT_PEER')
+            if expected:
+                assert conn.getpeername()[0] == expected, 'TCP 路由或 NAT 源地址不符'
             conn.settimeout(15)
             for _ in range(64):
                 data = exact(conn, len(block))
@@ -37,9 +41,14 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp, socket.socket(soc
                 conn.sendall(data)
         for size in sizes:
             data, peer = udp.recvfrom(65535)
+            if expected:
+                assert peer[0] == expected, 'UDP 路由或 NAT 源地址不符'
             assert data == (block[:size]), 'UDP 接收内容损坏'
             udp.sendto(data, peer)
     else:
+        if len(sys.argv) > 3:
+            tcp.bind((sys.argv[3], 0))
+            udp.bind((sys.argv[3], 0))
         tcp.connect((address, port))
         for _ in range(64):
             tcp.sendall(block)

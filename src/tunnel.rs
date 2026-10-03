@@ -73,12 +73,7 @@ async fn send_packets(
         };
         for i in 0..count {
             let packet = &packets[i][..sizes[i]];
-            if !valid_ipv4(
-                packet,
-                config.tun_address.addr(),
-                config.peer_address,
-                config.mtu,
-            ) {
+            if !valid_ipv4(packet, config.mtu) {
                 shared.counters(|c| c.invalid += 1);
                 continue;
             }
