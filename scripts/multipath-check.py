@@ -32,6 +32,14 @@ for old in removed:
 ping()
 assert status('server')['counters']['duplicates'] > 0
 assert status('client')['counters']['duplicates'] > 0
+# 静默下来后，成功入队的有效包应全部写入 TUN；重复副本不能重复计有效包。
+wait(lambda _: all((lambda c: c['rx_effective_packets'] == c['rx_packets'] and c['rx_packets'] > 0)(status(side)['counters']) for side in ['server', 'client']))
+for side in ['server', 'client']:
+    snapshot = status(side)
+    assert snapshot['counters']['rx_effective_bytes'] == snapshot['counters']['rx_bytes'], snapshot
+    assert sum(p['rx_effective_packets'] for p in snapshot['paths']) <= snapshot['counters']['rx_effective_packets'], snapshot
+print('两端有效接收包与 TUN 交付计数一致，重复副本单独统计，通过', flush=True)
+
 print('四条连接、双向双副本去重、备用到龄更换源端口通过', flush=True)
 
 # 给一条仍然连通的激活路径增加延迟，验证质量改善切换而非只做故障切换。

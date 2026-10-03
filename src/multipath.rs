@@ -93,6 +93,9 @@ pub struct Counters {
     pub tx_copies: u64,
     pub rx_packets: u64,
     pub rx_bytes: u64,
+    /// 校验、跨路径去重后成功进入接收队列的业务包，不含探测和重复副本。
+    pub rx_effective_packets: u64,
+    pub rx_effective_bytes: u64,
     pub duplicates: u64,
     pub too_old: u64,
     pub invalid: u64,
@@ -127,6 +130,9 @@ struct Path {
     tx_bytes: u64,
     rx_copies: u64,
     rx_bytes: u64,
+    rx_effective_packets: u64,
+    rx_effective_bytes: u64,
+    rx_duplicates: u64,
     queue_drops: u64,
 }
 impl Path {
@@ -206,6 +212,9 @@ pub struct PathStatus {
     pub tx_bytes: u64,
     pub rx_copies: u64,
     pub rx_bytes: u64,
+    pub rx_effective_packets: u64,
+    pub rx_effective_bytes: u64,
+    pub rx_duplicates: u64,
     pub queue_drops: u64,
     pub score: f64,
     pub slot: Option<usize>,
@@ -317,6 +326,9 @@ impl Shared {
                     quic_lost_packets: q.path.lost_packets,
                     tx_copies: p.tx_copies,
                     tx_bytes: p.tx_bytes,
+                    rx_effective_packets: p.rx_effective_packets,
+                    rx_effective_bytes: p.rx_effective_bytes,
+                    rx_duplicates: p.rx_duplicates,
                     rx_copies: p.rx_copies,
                     rx_bytes: p.rx_bytes,
                     queue_drops: p.queue_drops,
@@ -1190,6 +1202,9 @@ async fn connected(
                 acked_generation: 0,
                 tx_copies: 0,
                 tx_bytes: 0,
+                rx_effective_packets: 0,
+                rx_effective_bytes: 0,
+                rx_duplicates: 0,
                 rx_copies: 0,
                 rx_bytes: 0,
                 queue_drops: 0,
@@ -1352,7 +1367,12 @@ impl PathReceiver<'_> {
                     path.rx_bytes += packet.len() as u64;
                 }
                 match state.dedup.insert(sequence) {
-                    Verdict::Duplicate => state.counters.duplicates += 1,
+                    Verdict::Duplicate => {
+                        state.counters.duplicates += 1;
+                        if let Some(path) = state.paths.get_mut(&self.id) {
+                            path.rx_duplicates += 1;
+                        }
+                    }
                     Verdict::TooOld => state.counters.too_old += 1,
                     Verdict::New => {
                         if self
@@ -1361,6 +1381,13 @@ impl PathReceiver<'_> {
                             .is_err()
                         {
                             state.counters.rx_queue_drops += 1;
+                        } else {
+                            state.counters.rx_effective_packets += 1;
+                            state.counters.rx_effective_bytes += packet.len() as u64;
+                            if let Some(path) = state.paths.get_mut(&self.id) {
+                                path.rx_effective_packets += 1;
+                                path.rx_effective_bytes += packet.len() as u64;
+                            }
                         }
                     }
                 }
@@ -2189,6 +2216,47 @@ mod tests {
         assert!(server.validate().is_err());
     }
     #[tokio::test]
+    async fn effective_packets_exclude_probes_invalid_and_rejected_delivery() {
+        let (sid, _) = Identity::generate().unwrap();
+        let (cid, _) = Identity::generate().unwrap();
+        let port = free_ports();
+        let sc = config(Mode::Server, &cid.public, port);
+        let mut cc = config(Mode::Client, &sid.public, port);
+        cc.endpoint = Some(format!("127.0.0.1:{port}").parse().unwrap());
+        let mut server = Multipath::start(sc, sid).unwrap();
+        let mut client = Multipath::start(cc, cid).unwrap();
+        until(|| client.shared.snapshot().healthy == 1 && server.shared.snapshot().active == 1)
+            .await;
+        assert_eq!(
+            server.shared.snapshot().counters.rx_effective_packets,
+            0,
+            "探测不计业务包"
+        );
+        let mut selected = client.selected.clone();
+        let mut invalid = packet(1, false).to_vec();
+        invalid[21] = 192;
+        assert!(replicate(invalid.into(), &mut selected, &client.shared).await);
+        until(|| server.shared.snapshot().counters.invalid == 1).await;
+        assert_eq!(server.shared.snapshot().counters.rx_effective_packets, 0);
+        assert!(replicate(packet(1, false), &mut selected, &client.shared).await);
+        until(|| server.shared.snapshot().counters.rx_effective_packets == 1).await;
+        assert!(server.received.recv().await.is_some());
+        assert!(replicate(packet(1, false), &mut selected, &client.shared).await);
+        until(|| server.shared.snapshot().counters.duplicates == 1).await;
+        server.received.close();
+        assert!(replicate(packet(2, false), &mut selected, &client.shared).await);
+        until(|| server.shared.snapshot().counters.rx_queue_drops == 1).await;
+        let snapshot = server.shared.snapshot();
+        assert_eq!(snapshot.counters.rx_effective_packets, 1);
+        assert_eq!(snapshot.counters.rx_effective_bytes, 20);
+        assert_eq!(snapshot.paths[0].rx_effective_packets, 1);
+        assert_eq!(snapshot.paths[0].rx_effective_bytes, 20);
+        assert_eq!(snapshot.paths[0].rx_duplicates, 1);
+        client.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn real_h3_replication_rotation_failover_and_epoch_restart() {
         let (sid, _) = Identity::generate().unwrap();
         let (cid, _) = Identity::generate().unwrap();
@@ -2232,6 +2300,23 @@ mod tests {
             .unwrap();
         assert_eq!(&got[..], &packet(1, false)[9..]);
         until(|| server.shared.snapshot().counters.duplicates == 1).await;
+        let measured = server.shared.snapshot();
+        assert_eq!(measured.counters.rx_effective_packets, 1);
+        assert_eq!(measured.counters.rx_effective_bytes, 20);
+        assert_eq!(measured.counters.rx_packets, 0, "入队不等于已经写入 TUN");
+        assert_eq!(
+            measured
+                .paths
+                .iter()
+                .map(|p| p.rx_effective_packets)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(
+            measured.paths.iter().map(|p| p.rx_duplicates).sum::<u64>(),
+            1
+        );
+        assert_eq!(measured.paths.iter().map(|p| p.rx_copies).sum::<u64>(), 2);
         assert!(server.received.try_recv().is_err());
         let mut selected = server.selected.clone();
         assert!(replicate(packet(1, true), &mut selected, &server.shared).await);

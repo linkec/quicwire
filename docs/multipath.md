@@ -98,6 +98,25 @@ TTL 到期后持续复查，最佳健康备用比当前差太多则延后，不�
 
 ## 监控
 
+### 0.3.5：有效包与文本状态
+
+两端新增 `counters.rx_effective_packets`、`counters.rx_effective_bytes`：通过 IPv4/地址/长度校验、跨会话去重后，成功进入本机接收队列的唯一业务 IP 包数及 IP 字节数。探测、控制、重复、过旧、无效报文、接收入队失败均不计入。字节不含 QUIC/H3 或链路封装开销。
+
+每条路径也提供 `rx_effective_packets`、`rx_effective_bytes`，把有效包归因到首个成功入队的副本来源；`rx_duplicates` 记录该路径后来到达、被去重的副本。有效贡献低不一定表示路径无用：它仍可在快路径丢包时提供冗余，统计不能单独当作路径丢包率。
+
+原有 `counters.rx_packets/rx_bytes` 保持“批量写入 TUN 成功”的含义；`tx_packets/tx_bytes` 表示至少一个副本成功入发送队列的唯一业务包，`tx_copies` 表示已交给 QUIC 的发送副本数，不代表远端已收到。有效接收与写入 TUN 之间可能存在排队差额，不能混为同一个阶段。
+
+全局计数自当前进程启动累计，单路径计数自该会话建立累计；会话轮换或对端重启后，当前路径之和不一定等于进程历史总量。新字段只改变本机监控，不改变线协议。
+
+默认文本输出依次显示概览、业务统计、路径和异常计数。激活路径优先，其后是预留、普通备用和异常路径；地址另起一行，长 IPv6 地址不挤占数字列。`--verbose` 展开路径 ID、槽位、探测、评分、TTL、QUIC 及速率信息；`--json` 保持完整字段并追加新计数。新 CLI 读取缺少字段的旧快照时显示 `-`，不把未知值误作零。
+
+```sh
+sudo quicwire status --config /etc/quicwire/quicwire.toml
+sudo quicwire status --config /etc/quicwire/quicwire.toml --verbose
+sudo quicwire status --config /etc/quicwire/quicwire.toml --json
+```
+
+
 本机 quicwire status --config ... 输出整体与每路径状态，支持 --json。通过受文件权限限制的本地 Unix socket 读取快照，无网络管理 API。显示配置/实际 N/K、降级原因、端点、连接时长、连续备用时长、轮转次数、探测 RTT/波动/超时、QUIC 累计丢包估计、业务/副本计数、重复丢弃、队列丢弃和切换原因。QUIC 丢包不等于内层业务丢包。额外读取 TUN 的内核 tx_dropped/rx_dropped，区分包进入 QW 前的内核队列丢弃与进入复制逻辑后的路径损失。
 
 同 IP 不同端口不保证物理路由独立。K 副本约消耗 K 倍数据带宽，无法保证共享瓶颈或所有路径丢包时零丢包。
