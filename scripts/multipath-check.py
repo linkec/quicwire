@@ -42,17 +42,19 @@ print('两端有效接收包与 TUN 交付计数一致，重复副本单独统�
 
 print('四条连接、双向双副本去重、备用到龄更换源端口通过', flush=True)
 
-# 给一条仍然连通的激活路径增加延迟，验证质量改善切换而非只做故障切换。
-slow=next(p for p in status('client')['paths'] if p['state']=='active')
-slow_port=slow['remote'].rsplit(':',1)[1]
+# 给当前两条激活路径增加延迟，确保整个组合严格劣于备用组合。
+# hybrid 比较保障评分与最快副本；只拖慢另一副本不能保证组合评分改善。
+slow_remotes={p['remote'] for p in status('client')['paths'] if p['state']=='active'}
+assert len(slow_remotes)==2
 try:
     run(client_ns,['tc','qdisc','add','dev','outer0','root','handle','1:','prio','bands','3'])
     run(client_ns,['tc','qdisc','add','dev','outer0','parent','1:3','handle','30:','netem','delay','80ms'])
-    run(client_ns,['tc','filter','add','dev','outer0','protocol','ip','parent','1:','prio','1','u32','match','ip','protocol','17','0xff','match','ip','dport',slow_port,'0xffff','flowid','1:3'])
-    improved=wait(lambda s:s['active']==2 and any(p['id']==slow['id'] and p['state']=='standby' for p in s['paths']),15)
+    for priority,remote in enumerate(sorted(slow_remotes),1):
+        run(client_ns,['tc','filter','add','dev','outer0','protocol','ip','parent','1:','prio',str(priority),'u32','match','ip','protocol','17','0xff','match','ip','dport',remote.rsplit(':',1)[1],'0xffff','flowid','1:3'])
+    improved=wait(lambda s:s['active']==2 and all(p['remote'] not in slow_remotes for p in s['paths'] if p['state']=='active'),15)
     assert improved['reason']=='备用路径质量持续改善',improved
     ping()
-    print('激活路径增添 80ms 延迟后，经防抖替换为更低延迟备用路径通过',flush=True)
+    print('两条激活路径增添 80ms 延迟后，经防抖替换为更低延迟备用组合通过',flush=True)
 finally:
     run(client_ns,['tc','qdisc','del','dev','outer0','root'],False)
 
