@@ -113,12 +113,12 @@ pub async fn read(path: &Path, json: bool) -> Result<()> {
         }
     }
     println!(
-        "路径ID           状态       本地绑定 → 对端                            RTT(ms)  抖动(ms)  探测超时/次数  备用秒  评分/轮转角色/选路角色/TTL剩余秒"
+        "路径ID           状态       本地绑定 → 对端                            RTT(ms)  抖动(ms)  探测超时/次数  备用秒  评分/轮转角色/选路角色/TTL剩余秒/互斥组"
     );
     if let Some(paths) = value["paths"].as_array() {
         for p in paths {
             println!(
-                "{} {:<10} {} → {}  {:.2}  {:.2}  {}/{}  {}  {:.2}/{}/{}/{}",
+                "{} {:<10} {} → {}  {:.2}  {:.2}  {}/{}  {}  {:.2}/{}/{}/{}/{}",
                 p["id"].as_str().unwrap_or(""),
                 p["state"].as_str().unwrap_or(""),
                 p["local"].as_str().unwrap_or(""),
@@ -140,7 +140,8 @@ pub async fn read(path: &Path, json: bool) -> Result<()> {
                 p["ttl_remaining_secs"]
                     .as_u64()
                     .map(|s| s.to_string())
-                    .unwrap_or_else(|| "-".into())
+                    .unwrap_or_else(|| "-".into()),
+                p["exclusive_group"].as_str().unwrap_or("-")
             );
         }
     }

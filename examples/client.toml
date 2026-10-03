@@ -1,6 +1,11 @@
 mode = "client"
 bind = "0.0.0.0:0" # 每条连接使用独立 UDP socket，端口 0 允许轮转时更换五元组
-endpoints = ["192.0.2.1:4433-4440"] # 替换为服务器实际 IP；支持多个 IP 和端口范围
+# 替换为实际入口；同组最多一条激活，直连和中转分别一组。
+# 旧写法 endpoints = ["192.0.2.1:4433-4440"] 仍支持，但没有互斥约束。
+endpoints = [
+  { address = "192.0.2.1:4433-4440", exclusive_group = "direct" },
+  { address = "198.51.100.1:4433-4440", exclusive_group = "jp" },
+]
 max_sessions = 8
 active_sessions = 2
 selection_policy = "balanced" # low_latency（低延迟）、low_loss（低探测丢包）、balanced（综合）、hybrid（低丢包保障+低延迟副本）
@@ -8,7 +13,7 @@ standby_rotate_secs = 180 # 连续备用 180 秒后重新采样；0 关闭轮转
 switch_threshold_percent = 5.0 # 按策略评分改善超过 5% 才切换；省略时兼容旧值 20%
 stable_session_ttl_secs = 300 # 稳定会话 5 分钟后进入 TTL 质量检查；0 关闭
 ttl_max_degradation_percent = 10.0 # 接替备用的评分最多比当前差 10%；0 仅允许相等或更好
-reserve_sessions = 1 # 保留评分最好的健康备用，免于普通备用轮转；0 不预留
+reserve_sessions = 1 # 预留先覆盖不同组；两组各预留可设 2，0 不预留
 # 可选：你控制的服务域名，仅用于 SNI 和 HTTP authority
 # server_name = "vpn.example.com"
 private_key_file = "client.key"

@@ -107,6 +107,7 @@ struct Path {
     slot: usize,
     local: SocketAddr,
     remote: SocketAddr,
+    exclusive_group: Option<String>,
     connection: Connection,
     sender: mpsc::Sender<Bytes>,
     connected: Instant,
@@ -186,6 +187,7 @@ pub struct PathStatus {
     pub id: String,
     pub local: SocketAddr,
     pub remote: SocketAddr,
+    pub exclusive_group: Option<String>,
     pub state: &'static str,
     pub tx_bps: f64,
     pub rx_bps: f64,
@@ -288,6 +290,7 @@ impl Shared {
                     id: format!("{:016x}", p.id),
                     local: p.local,
                     remote: p.remote,
+                    exclusive_group: p.exclusive_group.clone(),
                     state: if !p.healthy(now) {
                         if p.seen.is_none() {
                             "probing"
@@ -366,7 +369,13 @@ impl Shared {
             reason: if active == 0 {
                 "没有可用激活连接".into()
             } else if active < s.configured_active {
-                "健康连接不足，实际副本数降低".into()
+                if self.config.mode == Mode::Client
+                    && paths.iter().any(|p| p.exclusive_group.is_some())
+                {
+                    "满足互斥组约束的健康路径不足，严格降级，不使用同组副本补齐".into()
+                } else {
+                    "健康连接不足，实际副本数降低".into()
+                }
             } else if paths.len() < s.configured_max {
                 "已连接数量未达到 max_sessions（候选数不足或连接失败）".into()
             } else {
@@ -466,19 +475,26 @@ impl Shared {
                     .map(|(id, _)| (*id, s.paths[id].slot))
                     .collect();
                 ordered.sort_by_key(|p| p.1);
-                let expected = s
-                    .configured_active
-                    .min(self.config.remote_addresses().map(|a| a.len()).unwrap_or(0));
-                let initial_ready =
-                    (0..expected).all(|slot| ordered.iter().any(|(_, i)| *i == slot));
+                let slots = self.config.client_slots().unwrap_or_default();
+                let mut groups = std::collections::BTreeSet::new();
+                let initial: Vec<_> = slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, targets)| match &targets[0].exclusive_group {
+                        Some(g) => groups.insert(g.clone()),
+                        None => true,
+                    })
+                    .take(s.configured_active)
+                    .map(|(slot, _)| slot)
+                    .collect();
+                let initial_ready = initial
+                    .iter()
+                    .all(|slot| ordered.iter().any(|(_, i)| i == slot));
                 if initial_ready
                     || now.duration_since(s.selection_started) >= transport::HANDSHAKE_TIMEOUT
                 {
-                    next = ordered
-                        .into_iter()
-                        .take(s.configured_active)
-                        .map(|p| p.0)
-                        .collect();
+                    next =
+                        distinct_paths(&s, ordered.into_iter().map(|p| p.0), s.configured_active);
                     if !next.is_empty() {
                         s.startup_pending = false;
                     }
@@ -489,15 +505,11 @@ impl Shared {
                     if next.len() >= s.configured_active {
                         break;
                     }
-                    if !next.contains(id) {
+                    if can_add_path(&s, &next, *id) {
                         next.push(*id);
                     }
                 }
-                let best: Vec<_> = candidates
-                    .iter()
-                    .take(s.configured_active)
-                    .map(|p| p.0)
-                    .collect();
+                let best = distinct_paths(&s, candidates.iter().map(|p| p.0), s.configured_active);
                 if next == s.active
                     && !best.is_empty()
                     && s.retiring.is_none()
@@ -506,6 +518,7 @@ impl Shared {
                     let old_scores = group_scores(&s, &next, policy);
                     let qualifies = |ids: &[u64]| {
                         ids.len() == s.configured_active
+                            && distinct_paths(&s, ids.iter().copied(), ids.len()).len() == ids.len()
                             && ids.iter().all(|id| {
                                 s.paths
                                     .get(id)
@@ -561,6 +574,11 @@ impl Shared {
                                     let mut trial = next.clone();
                                     let pos = trial.iter().position(|id| *id == old).unwrap();
                                     trial[pos] = *new;
+                                    if distinct_paths(&s, trial.iter().copied(), trial.len()).len()
+                                        != trial.len()
+                                    {
+                                        return None;
+                                    }
                                     let acceptable = if policy == SelectionPolicy::Hybrid {
                                         policy.ttl_allows(
                                             &path_candidates(&s, &next),
@@ -593,7 +611,7 @@ impl Shared {
                                 Some("TTL 到期，缺少经过至少 3 秒观察的健康备用，延后轮换".into());
                         } else {
                             s.ttl_waiting_reason = Some(
-                                "TTL 到期，最佳健康备用劣化超过容忍上限，继续使用并定期复查".into(),
+                                "TTL 到期，备用与互斥组冲突或质量劣化超过容忍上限，继续使用并定期复查".into(),
                             );
                         }
                     }
@@ -646,12 +664,19 @@ impl Shared {
                         && s.paths.get(&p.id).is_some_and(|p| !p.rotating)
                 })
                 .collect();
-            s.reserved = policy
-                .rank(&standby)
-                .iter()
-                .take(self.config.reserve_sessions)
-                .map(|p| p.id)
-                .collect();
+            let ranked: Vec<_> = policy.rank(&standby).iter().map(|p| p.id).collect();
+            // 有限预留名额先覆盖不同组，多余名额才允许保留同组额外候选。
+            let mut reserved =
+                distinct_paths(&s, ranked.iter().copied(), self.config.reserve_sessions);
+            for id in ranked {
+                if reserved.len() >= self.config.reserve_sessions {
+                    break;
+                }
+                if !reserved.contains(&id) {
+                    reserved.push(id);
+                }
+            }
+            s.reserved = reserved;
         }
         let active = s.active.clone();
         for p in s.paths.values_mut() {
@@ -696,6 +721,8 @@ impl Shared {
                             .values()
                             .filter(|other| {
                                 other.id != p.id
+                                    && (p.exclusive_group.is_none()
+                                        || other.exclusive_group == p.exclusive_group)
                                     && !active.contains(&other.id)
                                     && other.healthy(now)
                                     && now.duration_since(other.connected) >= Duration::from_secs(3)
@@ -737,6 +764,29 @@ impl Shared {
         }
         self.publish(&s);
     }
+}
+
+fn can_add_path(s: &State, selected: &[u64], id: u64) -> bool {
+    !selected.contains(&id)
+        && s.paths.get(&id).is_some_and(|p| {
+            p.exclusive_group.as_ref().is_none_or(|group| {
+                !selected
+                    .iter()
+                    .any(|other| s.paths[other].exclusive_group.as_ref() == Some(group))
+            })
+        })
+}
+fn distinct_paths(s: &State, ordered: impl IntoIterator<Item = u64>, limit: usize) -> Vec<u64> {
+    let mut selected = Vec::new();
+    for id in ordered {
+        if selected.len() >= limit {
+            break;
+        }
+        if can_add_path(s, &selected, id) {
+            selected.push(id);
+        }
+    }
+    selected
 }
 
 fn path_candidates(s: &State, ids: &[u64]) -> Vec<Candidate> {
@@ -909,15 +959,7 @@ async fn manage(
     let mut tasks = JoinSet::new();
     match config.mode {
         Mode::Client => {
-            let addresses = config.remote_addresses()?;
-            let slots = config.max_sessions.min(addresses.len());
-            for slot in 0..slots {
-                let candidates: Vec<_> = addresses
-                    .iter()
-                    .skip(slot)
-                    .step_by(slots)
-                    .copied()
-                    .collect();
+            for (slot, candidates) in config.client_slots()?.into_iter().enumerate() {
                 let client_config = client_config.clone();
                 let shared = shared.clone();
                 let config = config.clone();
@@ -927,7 +969,7 @@ async fn manage(
                     let mut backoff = 1u64;
                     let mut last_port = None;
                     loop {
-                        let address = candidates[attempt % candidates.len()];
+                        let address = candidates[attempt % candidates.len()].address;
                         attempt = attempt.wrapping_add(1);
                         let mut cfg = config.clone();
                         cfg.endpoint = Some(address);
@@ -1126,6 +1168,11 @@ async fn connected(
                 slot,
                 local,
                 remote: conn.remote_address(),
+                exclusive_group: if client {
+                    shared.config.exclusive_group(conn.remote_address())
+                } else {
+                    None
+                },
                 connection: conn.clone(),
                 sender: tx,
                 connected: Instant::now(),
@@ -1590,7 +1637,7 @@ mod tests {
             sc.bind = "0.0.0.0:0".parse().unwrap();
             sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
             let mut cc = config(Mode::Client, &sid.public, port);
-            cc.endpoints = sc.listen.clone();
+            cc.endpoints = sc.listen.iter().cloned().map(Into::into).collect();
             cc.max_sessions = 3;
             cc.active_sessions = count;
             cc.selection_policy = policy;
@@ -1666,7 +1713,7 @@ mod tests {
         sc.bind = "0.0.0.0:0".parse().unwrap();
         sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
         let mut cc = config(Mode::Client, &sid.public, port);
-        cc.endpoints = sc.listen.clone();
+        cc.endpoints = sc.listen.iter().cloned().map(Into::into).collect();
         cc.max_sessions = 3;
         cc.active_sessions = 2;
         cc.selection_policy = SelectionPolicy::Hybrid;
@@ -1752,7 +1799,7 @@ mod tests {
         sc.bind = "0.0.0.0:0".parse().unwrap();
         sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
         let mut cc = config(Mode::Client, &sid.public, port);
-        cc.endpoints = sc.listen.clone();
+        cc.endpoints = sc.listen.iter().cloned().map(Into::into).collect();
         cc.max_sessions = 3;
         cc.active_sessions = 1;
         cc.standby_rotate_secs = 5;
@@ -1881,6 +1928,207 @@ mod tests {
         server.shutdown().await;
     }
 
+    fn grouped(address: String, group: &str) -> crate::config::EndpointSpec {
+        crate::config::EndpointSpec::Options(crate::config::EndpointOptions {
+            address,
+            exclusive_group: Some(group.into()),
+        })
+    }
+
+    #[test]
+    fn exclusive_config_preserves_groups_across_odd_slot_rotation() {
+        let (id, _) = Identity::generate().unwrap();
+        let mut cfg = config(Mode::Client, &id.public, 4433);
+        cfg.max_sessions = 5;
+        cfg.active_sessions = 2;
+        cfg.endpoints = vec![
+            grouped("192.0.2.2:4433-4440".into(), "direct"),
+            grouped("192.0.2.1:4433-4438".into(), "jp"),
+        ];
+        cfg.validate().unwrap();
+        let slots = cfg.client_slots().unwrap();
+        assert_eq!(slots.len(), 5);
+        assert_eq!(slots[0][0].exclusive_group.as_deref(), Some("direct"));
+        assert_eq!(slots[1][0].exclusive_group.as_deref(), Some("jp"));
+        let mut addresses = std::collections::BTreeSet::new();
+        for slot in slots {
+            assert!(
+                slot.iter()
+                    .all(|t| t.exclusive_group == slot[0].exclusive_group)
+            );
+            for t in slot {
+                assert!(addresses.insert(t.address));
+            }
+        }
+        assert_eq!(addresses.len(), 14, "轮转覆盖全部端点，且不重复占槽");
+        cfg.endpoints
+            .push(grouped("192.0.2.3:4433".into(), "direct"));
+        cfg.validate().unwrap();
+        cfg.active_sessions = 3;
+        assert!(cfg.validate().is_err(), "两个组不能配置三副本");
+        cfg.endpoints.push("192.0.2.4:4433".into());
+        cfg.validate().unwrap();
+        cfg.endpoints.push(grouped("192.0.2.2:4433".into(), "jp"));
+        assert!(cfg.validate().is_err(), "同一端点不能归属两个组");
+        cfg.endpoints = vec![grouped("192.0.2.1:4433".into(), "")];
+        assert!(cfg.validate().is_err());
+        #[derive(serde::Deserialize)]
+        struct Entries {
+            endpoints: Vec<crate::config::EndpointSpec>,
+        }
+        let entries: Entries = toml::from_str(
+            "endpoints = ['192.0.2.1:4433', {address='192.0.2.2:4433',exclusive_group='jp'}]",
+        )
+        .unwrap();
+        assert_eq!(entries.endpoints.len(), 2);
+        assert!(
+            toml::from_str::<Entries>(
+                "endpoints = [{address='192.0.2.1:4433',exclusive_grop='jp'}]"
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn exclusive_groups_cover_start_selection_ttl_failure_and_recovery() {
+        for policy in [
+            SelectionPolicy::Balanced,
+            SelectionPolicy::LowLatency,
+            SelectionPolicy::LowLoss,
+            SelectionPolicy::Hybrid,
+        ] {
+            let (sid, _) = Identity::generate().unwrap();
+            let (cid, _) = Identity::generate().unwrap();
+            let port = free_ports();
+            let mut sc = config(Mode::Server, &cid.public, port);
+            sc.bind = "0.0.0.0:0".parse().unwrap();
+            sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
+            let mut cc = config(Mode::Client, &sid.public, port);
+            cc.endpoints = vec![
+                grouped(format!("127.0.0.1:{port}-{}", port + 1), "direct"),
+                grouped(format!("127.0.0.1:{}", port + 2), "jp"),
+            ];
+            cc.max_sessions = 3;
+            cc.active_sessions = 2;
+            cc.selection_policy = policy;
+            cc.standby_rotate_secs = 0;
+            cc.stable_session_ttl_secs = 5;
+            cc.switch_threshold_percent = 1.0;
+            cc.validate().unwrap();
+            let mut server = Multipath::start(sc, sid).unwrap();
+            let mut client = Multipath::start(cc, cid).unwrap();
+            until(|| client.shared.snapshot().healthy == 3 && server.shared.snapshot().active == 2)
+                .await;
+            let ids: Vec<_> = {
+                let s = client.shared.state.lock().unwrap();
+                (0..3)
+                    .map(|i| s.paths.values().find(|p| p.slot == i).unwrap().id)
+                    .collect()
+            };
+            // 未等待到 JP 时只能启动一条直连，即使另一条直连更快。
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                s.active.clear();
+                s.startup_pending = true;
+                s.selection_started = Instant::now() - Duration::from_secs(11);
+                for p in s.paths.values_mut() {
+                    p.seen = if p.slot == 1 {
+                        None
+                    } else {
+                        Some(Instant::now())
+                    };
+                }
+            }
+            client.shared.tick();
+            assert_eq!(client.shared.state.lock().unwrap().active, vec![ids[0]]);
+            assert!(client.shared.snapshot().reason.contains("互斥组"));
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                for p in s.paths.values_mut() {
+                    p.seen = Some(Instant::now());
+                    p.connected = Instant::now();
+                    p.rtt = [10.0, 100.0, 5.0][p.slot];
+                    p.jitter = 0.0;
+                    p.recent_loss = 0.0;
+                }
+            }
+            client.shared.tick();
+            assert!(client.shared.state.lock().unwrap().active.contains(&ids[1]));
+            client.shared.state.lock().unwrap().last_switch =
+                Instant::now() - Duration::from_secs(6);
+            client.shared.tick();
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                let (_, since) = s.challenger.as_mut().expect("更快同组候选应进入观察");
+                *since = Instant::now() - Duration::from_secs(4);
+            }
+            client.shared.tick();
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                assert!(s.active.contains(&ids[2]) && s.active.contains(&ids[1]));
+                s.last_rotation = Instant::now() - Duration::from_secs(3);
+                // JP 到期但无同组备用，不能拿直连备用把它挤掉。
+                for p in s.paths.values_mut() {
+                    p.connected =
+                        Instant::now() - Duration::from_secs(if p.slot == 1 { 6 } else { 4 });
+                }
+            }
+            client.shared.tick();
+            assert!(client.shared.state.lock().unwrap().retiring.is_none());
+            {
+                let mut s = client.shared.state.lock().unwrap();
+                s.paths.get_mut(&ids[0]).unwrap().rtt = 5.2;
+                s.paths.get_mut(&ids[1]).unwrap().connected = Instant::now();
+                s.paths.get_mut(&ids[2]).unwrap().connected =
+                    Instant::now() - Duration::from_secs(6);
+            }
+            client.shared.tick();
+            {
+                let s = client.shared.state.lock().unwrap();
+                assert_eq!(s.retiring, Some(ids[2]));
+                assert!(s.active.contains(&ids[0]) && s.active.contains(&ids[1]));
+                assert!(s.paths[&ids[2]].connection.close_reason().is_none());
+            }
+            // 交接中 JP 失效：严格单副本，不能把保留中的直连旧会话再激活。
+            client
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .get_mut(&ids[1])
+                .unwrap()
+                .seen = None;
+            client.shared.tick();
+            assert_eq!(client.shared.state.lock().unwrap().active, vec![ids[0]]);
+            assert_eq!(client.shared.selected.borrow().len(), 1);
+            client
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .paths
+                .get_mut(&ids[1])
+                .unwrap()
+                .seen = Some(Instant::now());
+            client.shared.tick();
+            until(|| {
+                server.shared.snapshot().active == 2 && client.shared.snapshot().ttl_rotations >= 1
+            })
+            .await;
+            let status = client.shared.snapshot();
+            let groups: std::collections::BTreeSet<_> = status
+                .paths
+                .iter()
+                .filter(|p| p.state == "active")
+                .map(|p| p.exclusive_group.clone())
+                .collect();
+            assert_eq!(groups.len(), 2);
+            client.shutdown().await;
+            server.shutdown().await;
+        }
+    }
+
     #[test]
     fn ranges_limits_and_rotation_validation() {
         use crate::config::expand_addresses;
@@ -1949,7 +2197,7 @@ mod tests {
         sc.bind = "0.0.0.0:0".parse().unwrap();
         sc.listen = vec![format!("127.0.0.1:{port}-{}", port + 2)];
         let mut cc = config(Mode::Client, &sid.public, port);
-        cc.endpoints = sc.listen.clone();
+        cc.endpoints = sc.listen.iter().cloned().map(Into::into).collect();
         cc.max_sessions = 3;
         cc.active_sessions = 2;
         cc.standby_rotate_secs = 5;

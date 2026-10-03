@@ -41,6 +41,8 @@ jobs:
           for pid in "${pids[@]}"; do wait "$pid" || failed=1; done
           cat selection-*.log
           exit "$failed"
+      - name: 互斥端点组、故障降级与恢复
+        run: sudo env QUICWIRE_TEST_EXCLUSIVE=true QUICWIRE_TEST_SELECTION_POLICY=hybrid bash scripts/linux-smoke.sh target/release/quicwire
       - name: 保存 Linux 测试构建
         uses: actions/upload-artifact@v7.0.1
         with:

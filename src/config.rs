@@ -14,6 +14,35 @@ pub enum Mode {
     Client,
 }
 
+/// 字符串保留旧格式；对象可把多个入口归入同一互斥组。
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EndpointSpec {
+    Address(String),
+    Options(EndpointOptions),
+}
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointOptions {
+    pub address: String,
+    pub exclusive_group: Option<String>,
+}
+impl From<String> for EndpointSpec {
+    fn from(value: String) -> Self {
+        Self::Address(value)
+    }
+}
+impl From<&str> for EndpointSpec {
+    fn from(value: &str) -> Self {
+        Self::Address(value.into())
+    }
+}
+#[derive(Clone, Debug)]
+pub struct RemoteTarget {
+    pub address: SocketAddr,
+    pub exclusive_group: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -23,7 +52,7 @@ pub struct Config {
     #[serde(default)]
     pub listen: Vec<String>,
     #[serde(default)]
-    pub endpoints: Vec<String>,
+    pub endpoints: Vec<EndpointSpec>,
     #[serde(default = "one")]
     pub max_sessions: usize,
     #[serde(default = "one")]
@@ -225,6 +254,21 @@ impl Config {
                     self.standby_rotate_secs == 0 || self.bind.port() == 0,
                     "启用备用轮转时 bind 必须使用端口 0，以更换五元组"
                 );
+                let slots = self.client_slots()?;
+                if slots.iter().any(|v| v[0].exclusive_group.is_some()) {
+                    let mut groups = std::collections::BTreeSet::new();
+                    let capacity = slots
+                        .iter()
+                        .filter(|v| match &v[0].exclusive_group {
+                            Some(g) => groups.insert(g.clone()),
+                            None => true,
+                        })
+                        .count();
+                    ensure!(
+                        capacity >= self.active_sessions,
+                        "exclusive_group 互斥约束下无法满足 active_sessions；增加不同组或减少激活数量"
+                    );
+                }
                 for endpoint in self.remote_addresses()? {
                     ensure!(
                         endpoint.port() != 0
@@ -250,28 +294,77 @@ impl Config {
 }
 
 impl Config {
-    pub fn remote_addresses(&self) -> Result<Vec<SocketAddr>> {
+    pub fn remote_targets(&self) -> Result<Vec<RemoteTarget>> {
         ensure!(
             self.endpoint.is_none() || self.endpoints.is_empty(),
             "endpoint 与 endpoints 不能同时设置"
         );
-        let addresses = match self.endpoint {
-            Some(a) => vec![a],
-            None => expand_addresses(&self.endpoints)?,
-        };
-        ensure!(
-            !addresses.is_empty(),
-            "client 必须设置 endpoint 或 endpoints"
-        );
-        // 按 IP 轮转，避免连续端口优先占满全部连接名额。
-        let mut groups: std::collections::BTreeMap<_, std::collections::VecDeque<_>> =
+        ensure!(self.endpoints.len() <= 256, "地址列表过长");
+        if let Some(address) = self.endpoint {
+            return Ok(vec![RemoteTarget {
+                address,
+                exclusive_group: None,
+            }]);
+        }
+        let mut targets = std::collections::BTreeMap::new();
+        // 保留显式组的配置顺序；无分组旧配置仍按 IP 交错。
+        let mut group_order = Vec::new();
+        for spec in &self.endpoints {
+            let (address, group) = match spec {
+                EndpointSpec::Address(a) => (a, None),
+                EndpointSpec::Options(o) => (&o.address, o.exclusive_group.clone()),
+            };
+            if let Some(name) = &group {
+                ensure!(
+                    !name.is_empty()
+                        && name.len() <= 64
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                    "exclusive_group 必须为 1–64 个字母、数字、下划线或连字符"
+                );
+                if !group_order.contains(name) {
+                    group_order.push(name.clone());
+                }
+            }
+            for address in expand_addresses(std::slice::from_ref(address))? {
+                if let Some(existing) = targets.get(&address) {
+                    ensure!(
+                        existing == &group,
+                        "同一端点不能配置冲突的 exclusive_group：{address}"
+                    );
+                } else {
+                    targets.insert(address, group.clone());
+                }
+            }
+            ensure!(targets.len() <= 256, "地址展开后超过 256 个");
+        }
+        ensure!(!targets.is_empty(), "client 必须设置 endpoint 或 endpoints");
+        let mut buckets: std::collections::BTreeMap<_, std::collections::VecDeque<_>> =
             std::collections::BTreeMap::new();
-        for a in addresses {
-            groups.entry(a.ip()).or_default().push_back(a);
+        for (address, exclusive_group) in targets {
+            let key = match &exclusive_group {
+                Some(g) => (
+                    0,
+                    group_order.iter().position(|n| n == g).unwrap(),
+                    address.ip(),
+                ),
+                None => (1, 0, address.ip()),
+            };
+            // 同名组跨 IP 也放在同一个桶内。
+            let key = if key.0 == 0 {
+                (key.0, key.1, "0.0.0.0".parse().unwrap())
+            } else {
+                key
+            };
+            buckets.entry(key).or_default().push_back(RemoteTarget {
+                address,
+                exclusive_group,
+            });
         }
         let mut result = Vec::new();
-        while !groups.is_empty() {
-            groups.retain(|_, values| {
+        while !buckets.is_empty() {
+            buckets.retain(|_, values| {
                 if let Some(a) = values.pop_front() {
                     result.push(a);
                 }
@@ -279,6 +372,55 @@ impl Config {
             });
         }
         Ok(result)
+    }
+    pub fn remote_addresses(&self) -> Result<Vec<SocketAddr>> {
+        Ok(self
+            .remote_targets()?
+            .into_iter()
+            .map(|t| t.address)
+            .collect())
+    }
+    /// 每个槽位只在同组入口中轮转，避免奇数 N 或不均匀组大小使分组漂移。
+    pub fn client_slots(&self) -> Result<Vec<Vec<RemoteTarget>>> {
+        let targets = self.remote_targets()?;
+        let count = self.max_sessions.min(targets.len());
+        if !targets.iter().any(|t| t.exclusive_group.is_some()) {
+            return Ok((0..count)
+                .map(|slot| targets.iter().skip(slot).step_by(count).cloned().collect())
+                .collect());
+        }
+        let mut result: Vec<Vec<RemoteTarget>> = targets
+            .iter()
+            .take(count)
+            .cloned()
+            .map(|t| vec![t])
+            .collect();
+        let mut cursor = std::collections::BTreeMap::new();
+        for target in targets.into_iter().skip(count) {
+            let slots: Vec<_> = result
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| v[0].exclusive_group == target.exclusive_group)
+                .map(|(i, _)| i)
+                .collect();
+            ensure!(
+                !slots.is_empty(),
+                "max_sessions 不足以为每个互斥组（及未分组入口）分配候选槽位"
+            );
+            let next = cursor
+                .entry(target.exclusive_group.clone())
+                .or_insert(0usize);
+            result[slots[*next % slots.len()]].push(target);
+            *next += 1;
+        }
+        Ok(result)
+    }
+    pub fn exclusive_group(&self, address: SocketAddr) -> Option<String> {
+        self.remote_targets()
+            .ok()?
+            .into_iter()
+            .find(|t| t.address == address)?
+            .exclusive_group
     }
     pub fn listen_addresses(&self) -> Result<Vec<SocketAddr>> {
         ensure!(
